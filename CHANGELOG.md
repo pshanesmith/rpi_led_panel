@@ -27,6 +27,16 @@ Ported from the upstream C++ library:
 - Allow negative angles for `Rotate` and reject angles that aren't multiples of 90 when creating the matrix.
 - Report invalid configurations (`pwm_bits`, `rows`, `cols`, `chain_length`, `parallel`, `refresh_rate`, `pwm_lsb_nanoseconds`) as errors instead of panicking, and report panics of the update thread during initialization with their message.
 - Fix the canvas size, centering and redundant clearing in the examples.
+- Fix the `P10Outdoor32x16QuarterScan` multiplexer, which made the canvas twice as tall as the panel and drew a
+  second parallel chain onto the lower data lines of the first one. Upstream has the same bug.
+- Fix the canvas width of the `U-mapper` for panels whose width isn't a multiple of 32, e.g. 40x20 or 80x40 panels.
+- Reject interlacing with the `B707ShiftRegister` row setter, which needs the rows in order.
+- `Canvas::fill` no longer lights up LEDs that aren't part of the canvas, e.g. panels left out with `Remap`.
+- Determine the Raspberry Pi model from the device tree if /proc/cpuinfo has no revision, instead of misreading the
+  CPU core revision.
+- Report pixel mappers that produce an empty canvas as an error.
+- Limit the queue of GPIO input changes so that it can't grow forever when nobody receives them.
+- Return an error instead of panicking when the user or group name to drop privileges to contains a NUL byte.
 
 ### Changed
 

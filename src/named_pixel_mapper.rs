@@ -32,18 +32,24 @@ pub enum NamedPixelMapperType {
     /// `--pixelmapping U-mapper`
     ///
     /// For example, a single chain display with four 32x32 panels like this:
+    /// ```text
     ///    [<][<][<][<] }- Raspberry Pi connector
+    /// ```
     ///
     /// can be arranged in this 64x64 U-shaped display:
+    /// ```text
     ///    [<][<] }----- Raspberry Pi connector
     ///    [>][>]
+    /// ```
     ///
     /// This U-shape configuration can also be applied to displays with multiple chains.
     /// For instance, an arrangement with two chains, each consisting of 8 panels, can be represented as follows:
+    /// ```text
     ///   [<][<][<][<]  }--- Pi connector #1
     ///   [>][>][>][>]
     ///   [<][<][<][<]  }--- Pi connector #2
     ///   [>][>][>][>]
+    /// ```
     UMapper,
 
     /// The `ChainLink` represents a pixel mapping strategy where a long chain
@@ -51,10 +57,12 @@ pub enum NamedPixelMapperType {
     ///
     /// For instance, a chain consisting of 12 panels, with 4 panels
     /// (`chain_length` = 4, `parallel` = 3) per connector, can be represented as follows:
+    /// ```text
     ///   [>][>][>][>] [>][>][>][>] [>][>][>][>]
     ///    │            │            └─ Pi connector #3
     ///    │            └─ Pi connector #2
     ///    └─> Pi connector #1
+    /// ```
     ChainLink,
 
     /// The "V-mapper" stacks the panels of each chain vertically instead of horizontally, with the parallel
@@ -408,7 +416,8 @@ impl NamedPixelMapper for UArrangeMapper {
         matrix_width: usize,
         matrix_height: usize,
     ) -> Result<[usize; 2], MatrixCreationError> {
-        let visible_width = (matrix_width / 64) * 32; // Div at 32px boundary
+        // The chain length is even, so this is a panel boundary.
+        let visible_width = matrix_width / 2;
         let visible_height = 2 * matrix_height;
         if !matrix_height.is_multiple_of(self.parallel) {
             let message = format!(
@@ -429,7 +438,7 @@ impl NamedPixelMapper for UArrangeMapper {
         y: usize,
     ) -> [usize; 2] {
         let panel_height = matrix_height / self.parallel;
-        let visible_width = (matrix_width / 64) * 32;
+        let visible_width = matrix_width / 2;
         let slab_height = 2 * panel_height; // one folded u-shape
         let base_y = (y / slab_height) * panel_height;
         let y_in_slab = y % slab_height;
@@ -778,6 +787,15 @@ mod tests {
             None
         );
         assert!(discarded.create(1, 1).is_err());
+    }
+
+    #[test]
+    fn u_mapper_folds_panels_of_any_width() {
+        // Two 40x20 panels in one chain fold into a 40x40 canvas.
+        let mapper = NamedPixelMapperType::UMapper.create(2, 1).unwrap();
+        assert_eq!(mapper.get_size_mapping(80, 20).unwrap(), [40, 40]);
+        assert_eq!(mapper.map_visible_to_matrix(80, 20, 0, 0), [40, 0]);
+        assert_eq!(mapper.map_visible_to_matrix(80, 20, 0, 20), [39, 19]);
     }
 
     #[test]

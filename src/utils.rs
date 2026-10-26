@@ -74,7 +74,7 @@ pub fn set_thread_affinity(_core_id: usize) -> bool {
 }
 
 fn get_gid_from_name(group: &str) -> Option<gid_t> {
-    let group_cstr = CString::new(group).unwrap();
+    let group_cstr = CString::new(group).ok()?;
     unsafe {
         let g = getgrnam(group_cstr.as_ptr());
         if g.is_null() { None } else { Some((*g).gr_gid) }
@@ -91,7 +91,7 @@ fn set_supplementary_groups(gid: gid_t) -> bool {
 }
 
 fn get_uid_from_name(user: &str) -> Option<uid_t> {
-    let user_cstr = CString::new(user).unwrap();
+    let user_cstr = CString::new(user).ok()?;
     unsafe {
         let p = getpwnam(user_cstr.as_ptr());
         if p.is_null() { None } else { Some((*p).pw_uid) }

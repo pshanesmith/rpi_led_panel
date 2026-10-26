@@ -89,7 +89,7 @@ impl MultiplexMapper {
     ) -> Result<[usize; 2], MatrixCreationError> {
         // Matrix width has been altered. Alter it back.
         let visible_width = matrix_width / self.kind.stretch_factor();
-        let visible_height = matrix_height * self.kind.stretch_factor();
+        let visible_height = matrix_height * self.kind.row_divisor();
         Ok([visible_width, visible_height])
     }
 
@@ -109,7 +109,7 @@ impl MultiplexMapper {
 
         let [new_x, new_y] = self.map_single_panel(within_panel_x, within_panel_y);
         let matrix_x = chained_panel * stretch_factor * self.panel_cols + new_x;
-        let matrix_y = parallel_panel * self.panel_rows / stretch_factor + new_y;
+        let matrix_y = parallel_panel * self.panel_rows / self.kind.row_divisor() + new_y;
         [matrix_x, matrix_y]
     }
 
@@ -471,6 +471,10 @@ mod tests {
         let (mut rows, mut cols) = (16, 32);
         mapper.edit_rows_cols(&mut rows, &mut cols);
         assert_eq!((rows, cols), (8, 128));
+        // The panel only uses the upper data lines, so the canvas is as tall as the panel.
+        assert_eq!(mapper.get_size_mapping(128, 8).unwrap(), [32, 16]);
+        // The panel of the second parallel chain starts after the 8 rows of the first chain.
+        assert_eq!(mapper.map_visible_to_matrix(128, 16, 0, 16), [24, 8]);
         assert_eq!(mapper.map_visible_to_matrix(128, 8, 0, 0), [24, 0]);
         assert_eq!(mapper.map_visible_to_matrix(128, 8, 9, 5), [49, 1]);
     }

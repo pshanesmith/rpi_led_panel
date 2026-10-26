@@ -100,6 +100,9 @@ pub(crate) struct PixelDesignatorMap {
     height: usize,
     pixel_designator: PixelDesignator,
     buffer: Vec<PixelDesignator>,
+    /// The bits of LEDs that no visible pixel maps to, by their offset in the first bit plane. They stay off when
+    /// filling the canvas.
+    hidden_bits: Vec<(usize, u32)>,
 }
 
 impl PixelDesignatorMap {
@@ -141,7 +144,32 @@ impl PixelDesignatorMap {
             height,
             pixel_designator,
             buffer: vec![pixel_designator; width * height],
+            hidden_bits: Vec::new(),
         }
+    }
+
+    /// Finds the LEDs of the physical `matrix` that this map doesn't reach.
+    pub(crate) fn find_hidden_bits(&mut self, matrix: &PixelDesignatorMap) {
+        let used = |d: &&PixelDesignator| d.is_used();
+        let len = matrix
+            .buffer
+            .iter()
+            .filter(used)
+            .map(|d| d.gpio_word as usize + 1)
+            .max()
+            .unwrap_or(0);
+        let mut bits = vec![0u32; len];
+        for d in matrix.buffer.iter().filter(used) {
+            bits[d.gpio_word as usize] |= !d.mask;
+        }
+        for d in self.buffer.iter().filter(used) {
+            bits[d.gpio_word as usize] &= d.mask;
+        }
+        self.hidden_bits = bits
+            .into_iter()
+            .enumerate()
+            .filter(|(_, bits)| *bits != 0)
+            .collect();
     }
 
     fn position(&self, x: usize, y: usize) -> Option<usize> {
@@ -172,8 +200,6 @@ impl PixelDesignatorMap {
 
 #[derive(Clone)]
 pub struct Canvas {
-    #[allow(unused)]
-    rows: usize,
     cols: usize,
     double_rows: usize,
     bitplane_buffer: Vec<u32>,
@@ -187,11 +213,9 @@ pub struct Canvas {
 impl Canvas {
     pub(crate) fn new(config: &RGBMatrixConfig, shared_mapper: Arc<PixelDesignatorMap>) -> Self {
         let color_lookup = &*CIE1931_LOOKUP;
-        let rows = config.rows * config.parallel;
         let cols = config.cols * config.chain_length;
         let double_rows = config.double_rows();
         Self {
-            rows,
             cols,
             double_rows,
             bitplane_buffer: vec![0u32; double_rows * cols * K_BIT_PLANES],
@@ -228,13 +252,9 @@ impl Canvas {
     }
 
     pub fn set_pixel(&mut self, x: usize, y: usize, r: u8, g: u8, b: u8) {
-        if x >= self.width() || y >= self.height() {
+        let Some(designator) = self.shared_mapper.get(x, y) else {
             return;
-        }
-        let designator = self
-            .shared_mapper
-            .get(x, y)
-            .expect("Pixel not in designator map. This is a bug.");
+        };
         let PixelDesignator {
             gpio_word,
             r_bit,
@@ -296,6 +316,11 @@ impl Canvas {
             (0..self.double_rows).for_each(|row| {
                 self.row_at_mut(row, 0, b).fill(plane_bits);
             });
+            if plane_bits != 0 {
+                for &(offset, bits) in &self.shared_mapper.hidden_bits {
+                    self.bitplane_buffer[offset + self.cols * b] &= !bits;
+                }
+            }
         });
     }
 
@@ -469,6 +494,29 @@ mod tests {
         canvas.set_pwm_bits(K_BIT_PLANES);
         let low_plane = canvas.row_at(0, 0, 0);
         assert!(low_plane.iter().all(|word| *word == 0));
+    }
+
+    #[test]
+    fn fill_keeps_hidden_leds_off() {
+        // The second panel is left out of the canvas.
+        let mut config = RGBMatrixConfig {
+            rows: 16,
+            cols: 32,
+            chain_length: 2,
+            pixelmapper: vec!["Remap:32,16|0,0n|0,0x".parse().unwrap()],
+            ..Default::default()
+        };
+        let map = crate::RGBMatrix::create_pixel_map(&mut config).unwrap();
+        let mut canvas = Canvas::new(&config, Arc::new(map));
+        canvas.fill(255, 255, 255);
+        // Only the bits of the first chain are sent to the panels.
+        let chain_bits = config.hardware_mapping.panels.color_bits[0].used_bits();
+        // The panels are counted from the Raspberry Pi, so the left out one is on the left of the matrix.
+        for plane in 0..K_BIT_PLANES {
+            let row = canvas.row_at(0, 0, plane);
+            assert!(row[..32].iter().all(|word| word & chain_bits == 0));
+            assert!(row[32..].iter().all(|word| word & chain_bits == chain_bits));
+        }
     }
 
     #[test]

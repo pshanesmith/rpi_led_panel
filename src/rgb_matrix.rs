@@ -6,7 +6,8 @@ use std::{
     sync::Arc,
     sync::atomic::{AtomicU32, Ordering},
     sync::mpsc::{
-        Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, channel, sync_channel,
+        Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError, channel,
+        sync_channel,
     },
     thread::{JoinHandle, spawn},
     time::Duration,
@@ -21,8 +22,12 @@ use crate::{
     gpio::{Gpio, GpioInitializationError},
     named_pixel_mapper::MappingDirection,
     pixel_mapper::PixelMapper,
+    row_address_setter::RowAddressSetterType,
     utils::{FrameRateMonitor, linux_has_isol_cpu, set_thread_affinity},
 };
+
+/// How many input changes are kept until they are received.
+const INPUT_QUEUE_LENGTH: usize = 256;
 
 fn initialize_update_thread(chip: PiChip) {
     // Pin the thread to the last core to avoid the flicker resulting from context switching.
@@ -185,7 +190,7 @@ impl RGBMatrix {
         let (canvas_from_thread_sender, canvas_from_thread_receiver) =
             sync_channel::<Box<Canvas>>(1);
         let (shutdown_sender, shutdown_receiver) = channel::<()>();
-        let (input_sender, input_receiver) = channel::<u32>();
+        let (input_sender, input_receiver) = sync_channel::<u32>(INPUT_QUEUE_LENGTH);
         let (thread_start_result_sender, thread_start_result_receiver) =
             channel::<Result<u32, MatrixCreationError>>();
         let framerate = Arc::new(AtomicU32::new(0));
@@ -241,13 +246,12 @@ impl RGBMatrix {
                 // Read input bits and send them if they have changed.
                 let new_inputs = gpio.read();
                 if new_inputs != last_gpio_inputs {
-                    match input_sender.send(new_inputs) {
-                        Ok(()) => {}
-                        Err(_) => {
-                            break 'thread;
-                        }
+                    match input_sender.try_send(new_inputs) {
+                        Ok(()) => last_gpio_inputs = new_inputs,
+                        // Nobody is receiving the inputs. Try again in the next frame.
+                        Err(TrySendError::Full(_)) => {}
+                        Err(TrySendError::Disconnected(_)) => break 'thread,
                     }
-                    last_gpio_inputs = new_inputs;
                 }
                 // Check for a swap canvas.
                 match canvas_to_thread_receiver.try_recv() {
@@ -326,7 +330,7 @@ impl RGBMatrix {
 
     /// Creates the map from visible pixels to the bit plane buffer. Multiplexers might change the physical
     /// layout, so this updates the rows and columns in the config before the hardware is set up.
-    fn create_pixel_map(
+    pub(crate) fn create_pixel_map(
         config: &mut RGBMatrixConfig,
     ) -> Result<PixelDesignatorMap, MatrixCreationError> {
         let multiplex_mapper = config.multiplexing.as_ref().map(|mapper_type| {
@@ -338,9 +342,11 @@ impl RGBMatrix {
         Self::validate_rows(config.rows)?;
 
         let pixel_designator = PixelDesignator::new(&config.hardware_mapping, config.led_sequence);
-        let mut shared_mapper = PixelDesignatorMap::new(pixel_designator, config);
+        let matrix = PixelDesignatorMap::new(pixel_designator, config);
+        let mut shared_mapper = matrix.clone();
 
         // Apply the mapping for the panels first.
+        let multiplex_mapper_applied = multiplex_mapper.is_some();
         if let Some(mapper) = multiplex_mapper {
             let mapper = PixelMapper::Multiplex(mapper);
             shared_mapper = Self::apply_pixel_mapper(&shared_mapper, &mapper, pixel_designator)?;
@@ -351,6 +357,9 @@ impl RGBMatrix {
             let mapper = mapper_type.create(config.chain_length, config.parallel)?;
             let mapper = PixelMapper::Named(mapper);
             shared_mapper = Self::apply_pixel_mapper(&shared_mapper, &mapper, pixel_designator)?;
+        }
+        if multiplex_mapper_applied || !config.pixelmapper.is_empty() {
+            shared_mapper.find_hidden_bits(&matrix);
         }
         Ok(shared_mapper)
     }
@@ -381,6 +390,12 @@ impl RGBMatrix {
         if config.refresh_rate == 0 {
             return invalid("refresh_rate must be at least 1.".to_string());
         }
+        // The B707 shift register advances by one row with every address, so the rows have to be in order.
+        if config.interlaced && config.row_setter == RowAddressSetterType::B707ShiftRegister {
+            return invalid(
+                "The B707ShiftRegister row setter does not support interlacing.".to_string(),
+            );
+        }
         Ok(())
     }
 
@@ -402,6 +417,11 @@ impl RGBMatrix {
         let old_width = shared_mapper.width();
         let old_height = shared_mapper.height();
         let [new_width, new_height] = mapper.get_size_mapping(old_width, old_height)?;
+        if new_width == 0 || new_height == 0 {
+            return Err(MatrixCreationError::PixelMapperError(format!(
+                "The pixel mapper turns the {old_width}x{old_height} matrix into an empty canvas."
+            )));
+        }
         let mut new_mapper = PixelDesignatorMap::blank(pixel_designator, new_width, new_height);
         let invalid_dimensions = || {
             MatrixCreationError::PixelMapperError(
@@ -488,7 +508,7 @@ impl RGBMatrix {
         self.enabled_input_bits
     }
 
-    /// Tries to receive a new GPIO input as specified with [`RGBMatrix::request_enabled_inputs`].
+    /// Tries to receive a new GPIO input as requested in [`RGBMatrix::new`].
     pub fn receive_new_inputs(&mut self, timeout: Duration) -> Option<u32> {
         self.input_receiver.recv_timeout(timeout).ok()
     }
@@ -621,6 +641,11 @@ mod tests {
             },
             RGBMatrixConfig {
                 pwm_lsb_nanoseconds: 0,
+                ..valid()
+            },
+            RGBMatrixConfig {
+                interlaced: true,
+                row_setter: crate::RowAddressSetterType::B707ShiftRegister,
                 ..valid()
             },
         ] {
