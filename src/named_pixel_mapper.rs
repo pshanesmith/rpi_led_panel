@@ -16,8 +16,8 @@ pub enum NamedPixelMapperType {
     /// Specify 'H' for horizontal mirroring or 'V' for vertical mirroring as a parameter after a colon.
     /// Example: `--pixelmapper Mirror:H`
     Mirror(bool),
-    /// The "Rotate" mapper allows you to rotate your screen by a specified angle in degrees.
-    /// Specify the desired angle as a parameter after a colon.
+    /// The "Rotate" mapper allows you to rotate your screen clockwise by a multiple of 90 degrees.
+    /// Specify the desired angle as a parameter after a colon. Negative angles rotate counterclockwise.
     /// Example: `--pixelmapper Rotate:90` for a 90-degree rotation.
     Rotate(usize),
     /// The `UMapper` represents a pixel mapping strategy where a long chain of display panels
@@ -73,14 +73,14 @@ impl FromStr for NamedPixelMapperType {
                     .into()),
                 },
                 "Rotate" => {
-                    if let Ok(angle) = param.parse::<usize>() {
+                    if let Ok(angle) = param.parse::<isize>() {
                         if angle % 90 != 0 {
                             return Err(format!(
                                 "'{angle}' is not valid. Rotation needs to be a multiple of 90 degrees"
                             )
                             .into());
                         }
-                        return Ok(Self::Rotate((angle + 360) % 360));
+                        return Ok(Self::Rotate(angle.rem_euclid(360).unsigned_abs()));
                     }
                     Err("Rotation angle is missing or invalid".into())
                 }
@@ -106,7 +106,14 @@ impl NamedPixelMapperType {
             NamedPixelMapperType::Mirror(horizontal) => {
                 Ok(Box::new(MirrorPixelMapper { horizontal }))
             }
-            NamedPixelMapperType::Rotate(angle) => Ok(Box::new(RotatePixelMapper { angle })),
+            NamedPixelMapperType::Rotate(angle) => {
+                if angle % 90 != 0 {
+                    return Err(MatrixCreationError::PixelMapperError(format!(
+                        "Rotation needs to be a multiple of 90 degrees, got {angle}."
+                    )));
+                }
+                Ok(Box::new(RotatePixelMapper { angle: angle % 360 }))
+            }
             NamedPixelMapperType::UMapper => Ok(Box::new(UArrangeMapper::new_with_parameters(
                 chain, parallel,
             )?)),
@@ -206,9 +213,8 @@ struct UArrangeMapper {
 impl UArrangeMapper {
     fn new_with_parameters(chain: usize, parallel: usize) -> Result<Self, MatrixCreationError> {
         if chain < 2 {
-            let message =
-                "UArrangeMapper: Chain length needs to be larger than 2 for useful folding"
-                    .to_string();
+            let message = "UArrangeMapper: Chain length needs to be at least 2 for useful folding"
+                .to_string();
             return Err(MatrixCreationError::PixelMapperError(message));
         }
         if !chain.is_multiple_of(2) {
@@ -293,5 +299,26 @@ impl NamedPixelMapper for ChainLinkMapper {
             visible_x % matrix_width,
             (matrix_height / self.parallel) * (visible_x / matrix_width) + visible_y,
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NamedPixelMapperType;
+    use std::str::FromStr;
+
+    #[test]
+    fn parses_rotation() {
+        let parse = |s| NamedPixelMapperType::from_str(s).ok();
+        assert_eq!(parse("Rotate:90"), Some(NamedPixelMapperType::Rotate(90)));
+        assert_eq!(parse("Rotate:-90"), Some(NamedPixelMapperType::Rotate(270)));
+        assert_eq!(parse("Rotate:450"), Some(NamedPixelMapperType::Rotate(90)));
+        assert_eq!(parse("Rotate:45"), None);
+    }
+
+    #[test]
+    fn rejects_invalid_rotation() {
+        assert!(NamedPixelMapperType::Rotate(45).create(1, 1).is_err());
+        assert!(NamedPixelMapperType::Rotate(450).create(1, 1).is_ok());
     }
 }

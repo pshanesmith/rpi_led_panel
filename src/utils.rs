@@ -1,6 +1,4 @@
-use libc::{
-    CPU_SET, cpu_set_t, getgrnam, getpwnam, gid_t, sched_setaffinity, setgid, setuid, uid_t,
-};
+use libc::{getgrnam, getpwnam, gid_t, setgid, setuid, uid_t};
 use std::{
     ffi::CString,
     fs::File,
@@ -28,7 +26,11 @@ pub(crate) fn linux_has_module_loaded(name: &str) -> bool {
         return false;
     };
     let reader = BufReader::new(file);
-    reader.lines().any(|line| line.unwrap().contains(name))
+    // Each line starts with the module name followed by a space.
+    reader
+        .lines()
+        .map_while(Result::ok)
+        .any(|line| line.split(' ').next() == Some(name))
 }
 
 pub(crate) fn linux_has_isol_cpu(cpu: usize) -> bool {
@@ -38,16 +40,37 @@ pub(crate) fn linux_has_isol_cpu(cpu: usize) -> bool {
     let reader = BufReader::new(file);
     reader
         .lines()
-        .any(|line| line.unwrap().contains(&cpu.to_string()))
+        .map_while(Result::ok)
+        .any(|line| cpu_list_contains(&line, cpu))
 }
 
+/// Checks if a kernel CPU list such as "1-3,5" contains the given CPU.
+fn cpu_list_contains(list: &str, cpu: usize) -> bool {
+    list.trim().split(',').any(|range| {
+        let mut bounds = range.split('-').map(|n| n.trim().parse::<usize>());
+        match (bounds.next(), bounds.next()) {
+            (Some(Ok(first)), None) => first == cpu,
+            (Some(Ok(first)), Some(Ok(last))) => (first..=last).contains(&cpu),
+            _ => false,
+        }
+    })
+}
+
+/// Pins the current thread to the given core. Returns `true` on success.
+#[cfg(target_os = "linux")]
 pub fn set_thread_affinity(core_id: usize) -> bool {
+    use libc::{CPU_SET, cpu_set_t, sched_setaffinity};
     let mut set: cpu_set_t = unsafe { std::mem::zeroed() };
     unsafe { CPU_SET(core_id, &mut set) }
     let cpusetsize = std::mem::size_of::<cpu_set_t>();
-    let mask = &set;
-    let res = unsafe { sched_setaffinity(0, cpusetsize, mask) };
-    res != 0
+    let res = unsafe { sched_setaffinity(0, cpusetsize, &set) };
+    res == 0
+}
+
+/// Thread affinity is only supported on Linux.
+#[cfg(not(target_os = "linux"))]
+pub fn set_thread_affinity(_core_id: usize) -> bool {
+    false
 }
 
 fn get_gid_from_name(group: &str) -> Option<gid_t> {
@@ -64,7 +87,7 @@ fn set_gid(gid: gid_t) -> bool {
 
 fn set_supplementary_groups(gid: gid_t) -> bool {
     let groups = [gid];
-    unsafe { libc::setgroups(groups.len(), groups.as_ptr()) == 0 }
+    unsafe { libc::setgroups(groups.len() as _, groups.as_ptr()) == 0 }
 }
 
 fn get_uid_from_name(user: &str) -> Option<uid_t> {
@@ -141,18 +164,42 @@ impl FrameRateMonitor {
     }
 }
 
-/// Sleep for as long as we are confortable without overshooting.
+/// Sleep for as long as we are comfortable without overshooting. The OS usually wakes us up late, so we
+/// leave a margin that the caller is expected to busy-wait for.
 pub(crate) fn sleep_at_most(duration: time::Duration) {
     const MIN_SYS_SLEEP_TIME: time::Duration = time::Duration::from_micros(200);
+    const SLEEP_JITTER_ALLOWANCE: time::Duration = time::Duration::from_micros(50);
     if duration > MIN_SYS_SLEEP_TIME {
-        thread::sleep(duration);
+        thread::sleep(duration - SLEEP_JITTER_ALLOWANCE);
+    }
+}
+
+/// Wait for the given number of nanoseconds, sleeping for longer durations and busy-waiting for the rest.
+pub(crate) fn sleep_nanos(nanos: u32) {
+    let start = time::Instant::now();
+    let duration = time::Duration::from_nanos(u64::from(nanos));
+    sleep_at_most(duration);
+    while start.elapsed() < duration {
+        std::hint::spin_loop();
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::cpu_list_contains;
+
     #[test]
     fn test_gpio_bits() {
         assert_eq!(gpio_bits!(1, 4, 5), 1 << 1 | 1 << 4 | 1 << 5);
+    }
+
+    #[test]
+    fn test_cpu_list_contains() {
+        assert!(cpu_list_contains("3\n", 3));
+        assert!(!cpu_list_contains("13", 3));
+        assert!(cpu_list_contains("1-3", 2));
+        assert!(cpu_list_contains("0,2-3", 3));
+        assert!(!cpu_list_contains("0,2-3", 1));
+        assert!(!cpu_list_contains("", 0));
     }
 }

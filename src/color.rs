@@ -1,4 +1,9 @@
+use std::sync::LazyLock;
+
 use crate::config::K_BIT_PLANES;
+
+/// The lookup table is the same for every canvas, so it is only computed once.
+pub(crate) static CIE1931_LOOKUP: LazyLock<ColorLookup> = LazyLock::new(ColorLookup::new_cie1931);
 
 // Do CIE1931 luminance correction and scale to output bitplanes
 fn luminance_cie1931(c: u8, brightness: u8) -> u16 {
@@ -12,7 +17,6 @@ fn luminance_cie1931(c: u8, brightness: u8) -> u16 {
         })) as u16
 }
 
-#[derive(Clone)]
 pub(crate) struct ColorLookup {
     per_brightness: [[u16; 256]; 100],
 }

@@ -5,7 +5,9 @@ use std::{
     mem::replace,
     sync::Arc,
     sync::atomic::{AtomicU32, Ordering},
-    sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError, channel, sync_channel},
+    sync::mpsc::{
+        Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, channel, sync_channel,
+    },
     thread::{JoinHandle, spawn},
     time::Duration,
 };
@@ -15,6 +17,7 @@ use crate::{
     RGBMatrixConfig,
     canvas::{Canvas, PixelDesignator, PixelDesignatorMap},
     chip::PiChip,
+    config::K_BIT_PLANES,
     gpio::{Gpio, GpioInitializationError},
     pixel_mapper::PixelMapper,
     utils::{FrameRateMonitor, linux_has_isol_cpu, set_thread_affinity},
@@ -23,7 +26,9 @@ use crate::{
 fn initialize_update_thread(chip: PiChip) {
     // Pin the thread to the last core to avoid the flicker resulting from context switching.
     let last_core_id = chip.num_cores() - 1;
-    set_thread_affinity(last_core_id);
+    if !set_thread_affinity(last_core_id) {
+        eprintln!("Could not pin the display update thread to core {last_core_id}.");
+    }
 
     // If the user has not setup isolcpus, let them know about the performance improvement.
     if chip.num_cores() > 1 && !linux_has_isol_cpu(last_core_id) {
@@ -64,6 +69,8 @@ pub enum MatrixCreationError {
     TooManyParallelChains(usize),
     InvalidDitherBits(usize),
     ThreadTimedOut,
+    ThreadPanicked(String),
+    InvalidConfig(String),
     GpioError(GpioInitializationError),
     MemoryAccessError,
     PixelMapperError(String),
@@ -85,6 +92,15 @@ impl Display for MatrixCreationError {
             }
             MatrixCreationError::ThreadTimedOut => {
                 f.write_str("The update thread did not return in time.")
+            }
+            MatrixCreationError::ThreadPanicked(message) => {
+                write!(
+                    f,
+                    "The update thread failed during initialization: {message}"
+                )
+            }
+            MatrixCreationError::InvalidConfig(message) => {
+                write!(f, "Invalid configuration: {message}")
             }
             MatrixCreationError::GpioError(error) => {
                 write!(f, "GPIO initialization error: {error}")
@@ -148,34 +164,9 @@ impl RGBMatrix {
         if config.parallel > max_parallel {
             return Err(MatrixCreationError::TooManyParallelChains(max_parallel));
         }
+        Self::validate_config(&config)?;
 
-        let multiplex_mapper = config.multiplexing.as_ref().map(|mapper_type| {
-            // The multiplexers might choose to have a different physical layout.
-            // We need to configure that first before setting up the hardware.
-            let mut mapper = mapper_type.create();
-            mapper.edit_rows_cols(&mut config.rows, &mut config.cols);
-            mapper
-        });
-
-        let pixel_designator = PixelDesignator::new(&config.hardware_mapping, config.led_sequence);
-        let width = config.cols * config.chain_length;
-        let height = config.rows * config.parallel;
-        let mut shared_mapper = PixelDesignatorMap::new(pixel_designator, width, height, &config);
-
-        // Apply the mapping for the panels first.
-        if let Some(mapper) = multiplex_mapper {
-            let mapper = PixelMapper::Multiplex(mapper);
-            shared_mapper =
-                Self::apply_pixel_mapper(&shared_mapper, &mapper, &config, pixel_designator)?;
-        }
-
-        // Apply higher level mappers that might arrange panels.
-        for mapper_type in config.pixelmapper.iter() {
-            let mapper = mapper_type.create(config.chain_length, config.parallel)?;
-            let mapper = PixelMapper::Named(mapper);
-            shared_mapper =
-                Self::apply_pixel_mapper(&shared_mapper, &mapper, &config, pixel_designator)?;
-        }
+        let shared_mapper = Self::create_pixel_map(&mut config)?;
 
         let dither_start_bits = match config.dither_bits {
             0 => [0, 0, 0, 0],
@@ -186,7 +177,7 @@ impl RGBMatrix {
 
         // Create two canvases, one for the display update thread and one for the user to modify. They will be
         // swapped out after each frame.
-        let canvas = Box::new(Canvas::new(&config, shared_mapper));
+        let canvas = Box::new(Canvas::new(&config, Arc::new(shared_mapper)));
         let mut thread_canvas = canvas.clone();
 
         let (canvas_to_thread_sender, canvas_to_thread_receiver) = sync_channel::<Box<Canvas>>(0);
@@ -207,9 +198,10 @@ impl RGBMatrix {
             let mut gpio = match Gpio::new(chip, &config, address_setter.as_ref()) {
                 Ok(gpio) => gpio,
                 Err(error) => {
+                    // If sending fails, the main thread has already given up waiting.
                     thread_start_result_sender
                         .send(Err(MatrixCreationError::GpioError(error)))
-                        .expect("Could not send to main thread.");
+                        .ok();
                     return;
                 }
             };
@@ -231,9 +223,13 @@ impl RGBMatrix {
                 .get_color_clock_mask(config.parallel);
 
             let enabled_input_bits = gpio.request_enabled_inputs(requested_inputs);
-            thread_start_result_sender
+            if thread_start_result_sender
                 .send(Ok(enabled_input_bits))
-                .expect("Could not send to main thread.");
+                .is_err()
+            {
+                // The main thread has already given up waiting.
+                return;
+            }
 
             'thread: loop {
                 let start_time = gpio.get_time();
@@ -296,9 +292,23 @@ impl RGBMatrix {
             );
         });
 
-        let enabled_input_bits = thread_start_result_receiver
-            .recv_timeout(Duration::from_secs(10))
-            .map_err(|_| MatrixCreationError::ThreadTimedOut)??;
+        let enabled_input_bits =
+            match thread_start_result_receiver.recv_timeout(Duration::from_secs(10)) {
+                Ok(result) => result?,
+                Err(RecvTimeoutError::Timeout) => return Err(MatrixCreationError::ThreadTimedOut),
+                Err(RecvTimeoutError::Disconnected) => {
+                    // The thread exited without reporting back, so it must have panicked.
+                    let message = match thread_handle.join() {
+                        Err(payload) => payload
+                            .downcast_ref::<&str>()
+                            .map(ToString::to_string)
+                            .or_else(|| payload.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "unknown panic".to_string()),
+                        Ok(()) => "thread exited unexpectedly".to_string(),
+                    };
+                    return Err(MatrixCreationError::ThreadPanicked(message));
+                }
+            };
 
         let rgbmatrix = Self {
             thread_handle: Some(thread_handle),
@@ -313,17 +323,85 @@ impl RGBMatrix {
         Ok((rgbmatrix, canvas))
     }
 
+    /// Creates the map from visible pixels to the bit plane buffer. Multiplexers might change the physical
+    /// layout, so this updates the rows and columns in the config before the hardware is set up.
+    fn create_pixel_map(
+        config: &mut RGBMatrixConfig,
+    ) -> Result<PixelDesignatorMap, MatrixCreationError> {
+        let multiplex_mapper = config.multiplexing.as_ref().map(|mapper_type| {
+            let mut mapper = mapper_type.create();
+            mapper.edit_rows_cols(&mut config.rows, &mut config.cols);
+            mapper
+        });
+        // The multiplexer changes the electrical layout, which has to be supported as well.
+        Self::validate_rows(config.rows)?;
+
+        let pixel_designator = PixelDesignator::new(&config.hardware_mapping, config.led_sequence);
+        let mut shared_mapper = PixelDesignatorMap::new(pixel_designator, config);
+
+        // Apply the mapping for the panels first.
+        if let Some(mapper) = multiplex_mapper {
+            let mapper = PixelMapper::Multiplex(mapper);
+            shared_mapper = Self::apply_pixel_mapper(&shared_mapper, &mapper, pixel_designator)?;
+        }
+
+        // Apply higher level mappers that might arrange panels.
+        for mapper_type in config.pixelmapper.iter() {
+            let mapper = mapper_type.create(config.chain_length, config.parallel)?;
+            let mapper = PixelMapper::Named(mapper);
+            shared_mapper = Self::apply_pixel_mapper(&shared_mapper, &mapper, pixel_designator)?;
+        }
+        Ok(shared_mapper)
+    }
+
+    /// Rejects configurations that would otherwise lead to panics or a blank display.
+    fn validate_config(config: &RGBMatrixConfig) -> Result<(), MatrixCreationError> {
+        let invalid = |message: String| Err(MatrixCreationError::InvalidConfig(message));
+        if config.cols == 0 || config.chain_length == 0 || config.parallel == 0 {
+            return invalid(format!(
+                "cols ({}), chain_length ({}) and parallel ({}) must be at least 1.",
+                config.cols, config.chain_length, config.parallel
+            ));
+        }
+        Self::validate_rows(config.rows)?;
+        if !(1..=K_BIT_PLANES).contains(&config.pwm_bits) {
+            return invalid(format!(
+                "pwm_bits must be between 1 and {K_BIT_PLANES}, got {}.",
+                config.pwm_bits
+            ));
+        }
+        // The PWM clock divider is `pwm_lsb_nanoseconds / 4` and needs to fit in 12 bits.
+        if !(4..16384).contains(&config.pwm_lsb_nanoseconds) {
+            return invalid(format!(
+                "pwm_lsb_nanoseconds must be between 4 and 16383, got {}.",
+                config.pwm_lsb_nanoseconds
+            ));
+        }
+        if config.refresh_rate == 0 {
+            return invalid("refresh_rate must be at least 1.".to_string());
+        }
+        Ok(())
+    }
+
+    /// The row address setters support up to 32 double rows.
+    fn validate_rows(rows: usize) -> Result<(), MatrixCreationError> {
+        if !(2..=64).contains(&rows) || !rows.is_multiple_of(2) {
+            return Err(MatrixCreationError::InvalidConfig(format!(
+                "rows must be an even number between 2 and 64, got {rows}."
+            )));
+        }
+        Ok(())
+    }
+
     fn apply_pixel_mapper(
         shared_mapper: &PixelDesignatorMap,
         mapper: &PixelMapper,
-        config: &RGBMatrixConfig,
         pixel_designator: PixelDesignator,
     ) -> Result<PixelDesignatorMap, MatrixCreationError> {
         let old_width = shared_mapper.width();
         let old_height = shared_mapper.height();
         let [new_width, new_height] = mapper.get_size_mapping(old_width, old_height)?;
-        let mut new_mapper =
-            PixelDesignatorMap::new(pixel_designator, new_width, new_height, config);
+        let mut new_mapper = PixelDesignatorMap::blank(pixel_designator, new_width, new_height);
         for y in 0..new_height {
             for x in 0..new_width {
                 let [orig_x, orig_y] = mapper.map_visible_to_matrix(old_width, old_height, x, y);
@@ -343,12 +421,17 @@ impl RGBMatrix {
     /// This returns a cleared canvas that has to be drawn to before calling this function again.
     /// If this function is not called before the next frame update, the previous
     /// frame is drawn again.
+    ///
+    /// The returned canvas has the same brightness and PWM bits as the one passed in.
     pub fn update_on_vsync(&mut self, canvas: Box<Canvas>) -> Box<Canvas> {
         let Self {
             canvas_to_thread_sender,
             canvas_from_thread_receiver,
             ..
         } = self;
+
+        let brightness = canvas.brightness();
+        let pwm_bits = canvas.pwm_bits();
 
         canvas_to_thread_sender
             .send(canvas)
@@ -357,6 +440,10 @@ impl RGBMatrix {
         let mut canvas = canvas_from_thread_receiver
             .recv()
             .expect("Display update thread shut down unexpectedly.");
+
+        // Both canvases need the same settings, otherwise they would alternate between frames.
+        canvas.set_brightness(brightness);
+        canvas.set_pwm_bits(pwm_bits);
 
         // Clear the canvas before handing it back to the user.
         // There is no practical use for not clearing it here as we switch
@@ -393,6 +480,80 @@ impl Drop for RGBMatrix {
         if let Some(handle) = thread_handle.take() {
             shutdown_sender.send(()).ok();
             let _result = handle.join();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RGBMatrix;
+    use crate::{MultiplexMapperType, NamedPixelMapperType, RGBMatrixConfig};
+
+    #[test]
+    fn rotates_long_chain() {
+        let mut config = RGBMatrixConfig {
+            rows: 32,
+            cols: 64,
+            chain_length: 4,
+            pixelmapper: vec![NamedPixelMapperType::Rotate(90)],
+            ..Default::default()
+        };
+        let map = RGBMatrix::create_pixel_map(&mut config).unwrap();
+        assert_eq!((map.width(), map.height()), (32, 256));
+    }
+
+    #[test]
+    fn multiplexes_parallel_chains() {
+        let mut config = RGBMatrixConfig {
+            rows: 16,
+            cols: 32,
+            parallel: 2,
+            multiplexing: Some(MultiplexMapperType::Kaler2Scan),
+            ..Default::default()
+        };
+        let map = RGBMatrix::create_pixel_map(&mut config).unwrap();
+        assert_eq!((map.width(), map.height()), (32, 32));
+    }
+
+    #[test]
+    fn rejects_invalid_config() {
+        let valid = RGBMatrixConfig::default;
+        assert!(RGBMatrix::validate_config(&valid()).is_ok());
+        for config in [
+            RGBMatrixConfig {
+                pwm_bits: 0,
+                ..valid()
+            },
+            RGBMatrixConfig {
+                pwm_bits: 12,
+                ..valid()
+            },
+            RGBMatrixConfig {
+                rows: 128,
+                ..valid()
+            },
+            RGBMatrixConfig {
+                rows: 33,
+                ..valid()
+            },
+            RGBMatrixConfig {
+                parallel: 0,
+                ..valid()
+            },
+            RGBMatrixConfig {
+                chain_length: 0,
+                ..valid()
+            },
+            RGBMatrixConfig {
+                refresh_rate: 0,
+                ..valid()
+            },
+            RGBMatrixConfig {
+                pwm_lsb_nanoseconds: 0,
+                ..valid()
+            },
+        ] {
+            assert!(RGBMatrix::validate_config(&config).is_err(), "{config:?}");
         }
     }
 }

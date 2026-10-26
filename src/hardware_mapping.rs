@@ -120,20 +120,19 @@ impl FromStr for HardwareMapping {
 }
 
 impl HardwareMapping {
-    pub(crate) fn used_bits(&self) -> u32 {
-        self.output_enable | self.clock | self.strobe | self.panels.used_bits()
+    /// All bits used for output when driving `parallel` chains, except for the row address.
+    pub(crate) fn used_bits(&self, parallel: usize) -> u32 {
+        self.output_enable | self.strobe | self.get_color_clock_mask(parallel)
     }
 
     /// Mask of bits while clocking in.
     pub(crate) fn get_color_clock_mask(&self, parallel: usize) -> u32 {
-        let mut color_clk_mask: u32 = 0;
-        (0..6).for_each(|panel| {
-            if parallel > panel {
-                color_clk_mask |= &self.panels.color_bits[panel].used_bits();
-            }
-        });
-        color_clk_mask |= self.clock;
-        color_clk_mask
+        self.panels
+            .color_bits
+            .iter()
+            .take(parallel)
+            .map(ColorBits::used_bits)
+            .fold(self.clock, BitOr::bitor)
     }
 
     pub(crate) fn max_parallel_chains(&self) -> usize {
@@ -260,10 +259,10 @@ impl HardwareMapping {
             panels: Panels {
                 color_bits: [
                     ColorBits {
+                        r1: gpio_bits!(11), // masks: SPI0_SCKL
                         // On Pi1 Rev1, the pin other Pis have GPIO27, these have GPIO21. So make this work for
                         // both Rev1 and Rev2.
-                        r1: gpio_bits!(15, 27),
-                        g1: gpio_bits!(21),
+                        g1: gpio_bits!(21, 27),
                         b1: gpio_bits!(7),  // masks: SPI0_CE1
                         r2: gpio_bits!(8),  // masks: SPI0_CE0
                         g2: gpio_bits!(9),  // masks: SPI0_MISO
@@ -363,5 +362,26 @@ impl HardwareMapping {
                 ],
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HardwareMapping;
+    use crate::gpio_bits;
+
+    #[test]
+    fn used_bits_only_include_parallel_chains() {
+        let regular = HardwareMapping::regular();
+        // Chain 2 uses the I2C and UART pins, which must stay free for a single chain.
+        let i2c_uart = gpio_bits!(2, 3, 14);
+        assert_eq!(regular.used_bits(1) & i2c_uart, 0);
+        assert_eq!(regular.used_bits(3) & i2c_uart, i2c_uart);
+    }
+
+    #[test]
+    fn regular_pi1_does_not_overlap_row_address() {
+        let mapping = HardwareMapping::regular_pi1();
+        assert_eq!(mapping.used_bits(1) & mapping.e, 0);
     }
 }

@@ -1,13 +1,20 @@
+use std::sync::Arc;
+
 use crate::{
-    RGBMatrixConfig, color::ColorLookup, config::K_BIT_PLANES, error::InvalidVariantError,
-    gpio::Gpio, hardware_mapping::HardwareMapping, row_address_setter::RowAddressSetter,
+    RGBMatrixConfig,
+    color::{CIE1931_LOOKUP, ColorLookup},
+    config::K_BIT_PLANES,
+    error::InvalidVariantError,
+    gpio::Gpio,
+    hardware_mapping::HardwareMapping,
+    row_address_setter::RowAddressSetter,
 };
 
-#[derive(Clone, Copy)]
-pub(crate) enum Channel {
-    First,
-    Second,
-    Third,
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Color {
+    Red,
+    Green,
+    Blue,
 }
 
 #[derive(
@@ -29,30 +36,37 @@ pub enum LedSequence {
 }
 
 impl LedSequence {
-    fn get_gpio(self, channel: Channel, red_bits: u32, green_bits: u32, blue_bits: u32) -> u32 {
-        match channel {
-            Channel::First => match self {
-                LedSequence::Rgb | LedSequence::Rbg => red_bits,
-                LedSequence::Grb | LedSequence::Gbr => green_bits,
-                LedSequence::Brg | LedSequence::Bgr => blue_bits,
-            },
-            Channel::Second => match self {
-                LedSequence::Rgb | LedSequence::Bgr => green_bits,
-                LedSequence::Grb | LedSequence::Brg => red_bits,
-                LedSequence::Gbr | LedSequence::Rbg => blue_bits,
-            },
-            Channel::Third => match self {
-                LedSequence::Rgb | LedSequence::Grb => blue_bits,
-                LedSequence::Gbr | LedSequence::Bgr => red_bits,
-                LedSequence::Rbg | LedSequence::Brg => green_bits,
-            },
+    /// The order in which the colors appear on the panel's R, G and B inputs.
+    const fn colors(self) -> [Color; 3] {
+        match self {
+            LedSequence::Rgb => [Color::Red, Color::Green, Color::Blue],
+            LedSequence::Rbg => [Color::Red, Color::Blue, Color::Green],
+            LedSequence::Grb => [Color::Green, Color::Red, Color::Blue],
+            LedSequence::Gbr => [Color::Green, Color::Blue, Color::Red],
+            LedSequence::Brg => [Color::Blue, Color::Red, Color::Green],
+            LedSequence::Bgr => [Color::Blue, Color::Green, Color::Red],
         }
+    }
+
+    /// Returns the GPIO bits that drive `color`: the input at the position of `color` in the sequence.
+    fn get_gpio(self, color: Color, red_bits: u32, green_bits: u32, blue_bits: u32) -> u32 {
+        let inputs = [red_bits, green_bits, blue_bits];
+        let position = self
+            .colors()
+            .iter()
+            .position(|c| *c == color)
+            .expect("Every sequence contains every color.");
+        inputs[position]
     }
 }
 
+/// Marks a pixel that is not connected to any LED.
+const UNUSED_PIXEL: u32 = u32::MAX;
+
 #[derive(Clone, Copy)]
 pub(crate) struct PixelDesignator {
-    gpio_word: Option<usize>,
+    /// Offset into the bit plane buffer, or [`UNUSED_PIXEL`].
+    gpio_word: u32,
     r_bit: u32,
     g_bit: u32,
     b_bit: u32,
@@ -66,10 +80,10 @@ impl PixelDesignator {
         let g = h.panels.green_bits();
         let b = h.panels.blue_bits();
         Self {
-            gpio_word: None,
-            r_bit: sequence.get_gpio(Channel::First, r, g, b),
-            g_bit: sequence.get_gpio(Channel::Second, r, g, b),
-            b_bit: sequence.get_gpio(Channel::Third, r, g, b),
+            gpio_word: UNUSED_PIXEL,
+            r_bit: sequence.get_gpio(Color::Red, r, g, b),
+            g_bit: sequence.get_gpio(Color::Green, r, g, b),
+            b_bit: sequence.get_gpio(Color::Blue, r, g, b),
             mask: !0u32,
         }
     }
@@ -84,21 +98,19 @@ pub(crate) struct PixelDesignatorMap {
 }
 
 impl PixelDesignatorMap {
-    pub(crate) fn new(
-        pixel_designator: PixelDesignator,
-        width: usize,
-        height: usize,
-        config: &RGBMatrixConfig,
-    ) -> Self {
-        let mut buffer = vec![pixel_designator; width * height];
+    /// Creates the map for the physical matrix of `config.parallel` chains of `config.chain_length` panels.
+    pub(crate) fn new(pixel_designator: PixelDesignator, config: &RGBMatrixConfig) -> Self {
+        let width = config.cols * config.chain_length;
+        let height = config.rows * config.parallel;
+        let mut map = Self::blank(pixel_designator, width, height);
         let hm = config.hardware_mapping;
         let double_rows = config.double_rows();
         for y in 0..height {
             for x in 0..width {
                 let position = y * width + x;
-                let d = &mut buffer[position];
+                let d = &mut map.buffer[position];
                 let offset = (y % double_rows) * (width * K_BIT_PLANES) + x;
-                d.gpio_word = Some(offset);
+                d.gpio_word = u32::try_from(offset).expect("Matrix is too large.");
 
                 let panel = y / config.rows;
                 let color_bits = hm.panels.color_bits[panel];
@@ -108,17 +120,22 @@ impl PixelDesignatorMap {
                     (color_bits.r2, color_bits.g2, color_bits.b2)
                 };
 
-                d.r_bit = config.led_sequence.get_gpio(Channel::First, r, g, b);
-                d.g_bit = config.led_sequence.get_gpio(Channel::Second, r, g, b);
-                d.b_bit = config.led_sequence.get_gpio(Channel::Third, r, g, b);
+                d.r_bit = config.led_sequence.get_gpio(Color::Red, r, g, b);
+                d.g_bit = config.led_sequence.get_gpio(Color::Green, r, g, b);
+                d.b_bit = config.led_sequence.get_gpio(Color::Blue, r, g, b);
                 d.mask = !(d.r_bit | d.g_bit | d.b_bit);
             }
         }
+        map
+    }
+
+    /// Creates a map with every pixel unused, to be filled by a pixel mapper.
+    pub(crate) fn blank(pixel_designator: PixelDesignator, width: usize, height: usize) -> Self {
         Self {
             width,
             height,
             pixel_designator,
-            buffer,
+            buffer: vec![pixel_designator; width * height],
         }
     }
 
@@ -152,16 +169,16 @@ pub struct Canvas {
     cols: usize,
     double_rows: usize,
     bitplane_buffer: Vec<u32>,
-    shared_mapper: PixelDesignatorMap,
+    shared_mapper: Arc<PixelDesignatorMap>,
     pwm_bits: usize,
     brightness: u8,
-    color_lookup: ColorLookup,
+    color_lookup: &'static ColorLookup,
     interlaced: bool,
 }
 
 impl Canvas {
-    pub(crate) fn new(config: &RGBMatrixConfig, shared_mapper: PixelDesignatorMap) -> Self {
-        let color_lookup = ColorLookup::new_cie1931();
+    pub(crate) fn new(config: &RGBMatrixConfig, shared_mapper: Arc<PixelDesignatorMap>) -> Self {
+        let color_lookup = &*CIE1931_LOOKUP;
         let rows = config.rows * config.parallel;
         let cols = config.cols * config.chain_length;
         let double_rows = config.double_rows();
@@ -171,7 +188,7 @@ impl Canvas {
             double_rows,
             bitplane_buffer: vec![0u32; double_rows * cols * K_BIT_PLANES],
             shared_mapper,
-            pwm_bits: config.pwm_bits,
+            pwm_bits: config.pwm_bits.clamp(1, K_BIT_PLANES),
             brightness: config.led_brightness.clamp(1, 100),
             color_lookup,
             interlaced: config.interlaced,
@@ -218,10 +235,10 @@ impl Canvas {
             mask: designator_mask,
         } = *designator;
 
-        let Some(pos_start) = gpio_word else {
-            // non-used pixel marker.
+        if gpio_word == UNUSED_PIXEL {
             return;
-        };
+        }
+        let pos_start = gpio_word as usize;
 
         let [red, green, blue] = self.color_lookup.lookup_rgb(self.brightness, r, g, b);
 
@@ -285,7 +302,8 @@ impl Canvas {
         // Depending on if we do dithering, we might not always show the lowest bits.
         let start_bit = (K_BIT_PLANES - self.pwm_bits).max(pwm_low_bit);
 
-        let half_double = self.double_rows / 2;
+        // Round up so that an odd number of rows still shows every row exactly once.
+        let half_double = self.double_rows.div_ceil(2);
         for row_loop in 0..self.double_rows {
             let d_row = if self.interlaced {
                 if row_loop < half_double {
@@ -325,15 +343,36 @@ impl Canvas {
         }
     }
 
-    // Set PWM bits used for output. Default is 11, but if you only deal with
-    // simple comic-colors, 1 might be sufficient. Lower values require less CPU.
+    /// Set PWM bits used for output, between 1 and 11. Default is 11, but if you only deal with simple
+    /// comic-colors, 1 might be sufficient. Lower values require less CPU.
+    ///
+    /// The setting carries over to the canvases returned by [`crate::RGBMatrix::update_on_vsync`].
     pub fn set_pwm_bits(&mut self, pwm_bits: usize) {
+        let pwm_bits = pwm_bits.clamp(1, K_BIT_PLANES);
+        // Planes that become visible may still hold data from long ago.
+        for plane in K_BIT_PLANES - pwm_bits..K_BIT_PLANES - self.pwm_bits.min(pwm_bits) {
+            for row in 0..self.double_rows {
+                self.row_at_mut(row, 0, plane).fill(0);
+            }
+        }
         self.pwm_bits = pwm_bits;
     }
 
-    /// Set the canvas' brightness in percent.
+    #[must_use]
+    pub fn pwm_bits(&self) -> usize {
+        self.pwm_bits
+    }
+
+    /// Set the canvas' brightness in percent. Only affects pixels drawn afterwards.
+    ///
+    /// The setting carries over to the canvases returned by [`crate::RGBMatrix::update_on_vsync`].
     pub fn set_brightness(&mut self, brightness: u8) {
         self.brightness = brightness.clamp(1, 100);
+    }
+
+    #[must_use]
+    pub fn brightness(&self) -> u8 {
+        self.brightness
     }
 }
 
@@ -384,5 +423,52 @@ pub mod embedded_graphics_support {
             self.fill(color.r(), color.g(), color.b());
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Canvas, Color, LedSequence, PixelDesignator, PixelDesignatorMap};
+    use crate::{RGBMatrixConfig, config::K_BIT_PLANES};
+    use std::sync::Arc;
+
+    #[test]
+    fn led_sequence_matches_upstream() {
+        // Upstream drives each color on the input at the color's position in the sequence.
+        let (r, g, b) = (1, 2, 4);
+        let bits = |seq: LedSequence| {
+            [Color::Red, Color::Green, Color::Blue].map(|color| seq.get_gpio(color, r, g, b))
+        };
+        assert_eq!(bits(LedSequence::Rgb), [r, g, b]);
+        assert_eq!(bits(LedSequence::Gbr), [b, r, g]);
+        assert_eq!(bits(LedSequence::Brg), [g, b, r]);
+        assert_eq!(bits(LedSequence::Bgr), [b, g, r]);
+    }
+
+    fn canvas(config: &RGBMatrixConfig) -> Canvas {
+        let designator = PixelDesignator::new(&config.hardware_mapping, config.led_sequence);
+        Canvas::new(
+            config,
+            Arc::new(PixelDesignatorMap::new(designator, config)),
+        )
+    }
+
+    #[test]
+    fn increasing_pwm_bits_clears_stale_planes() {
+        let mut canvas = canvas(&RGBMatrixConfig::default());
+        canvas.fill(255, 255, 255);
+        canvas.set_pwm_bits(1);
+        canvas.set_pwm_bits(K_BIT_PLANES);
+        let low_plane = canvas.row_at(0, 0, 0);
+        assert!(low_plane.iter().all(|word| *word == 0));
+    }
+
+    #[test]
+    fn pwm_bits_are_clamped() {
+        let mut canvas = canvas(&RGBMatrixConfig::default());
+        canvas.set_pwm_bits(20);
+        assert_eq!(canvas.pwm_bits(), K_BIT_PLANES);
+        canvas.set_pwm_bits(0);
+        assert_eq!(canvas.pwm_bits(), 1);
     }
 }

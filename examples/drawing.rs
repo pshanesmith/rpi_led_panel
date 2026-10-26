@@ -12,15 +12,15 @@ use rpi_led_panel::{RGBMatrix, RGBMatrixConfig};
 
 fn main() {
     let config: RGBMatrixConfig = argh::from_env();
-    let rows = config.rows as i32;
-    let cols = config.cols as i32;
-
     let (mut matrix, mut canvas) = RGBMatrix::new(config, 0).expect("Matrix initialization failed");
+    // The canvas size includes chained panels and pixel mappers.
+    let rows = canvas.height() as i32;
+    let cols = canvas.width() as i32;
 
     let circle = {
         let thin_stroke = PrimitiveStyle::with_stroke(Rgb888::CSS_GRAY, 1);
         Circle::with_center(
-            Point::new(rows / 2 - 1, cols / 2 - 1),
+            Point::new(cols / 2 - 1, rows / 2 - 1),
             rows.min(cols) as u32 - 2,
         )
         .into_styled(thin_stroke)
@@ -46,7 +46,7 @@ fn main() {
     );
 
     for step in 0.. {
-        canvas.fill(0, 0, 0);
+        // The canvas returned by `update_on_vsync` is already cleared.
         circle.draw(canvas.as_mut()).unwrap();
         [diagonal1, diagonal2, top, bottom, left, right]
             .iter()

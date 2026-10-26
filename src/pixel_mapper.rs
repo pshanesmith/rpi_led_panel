@@ -8,7 +8,7 @@ use crate::{
 /// to the `RGBMatrix::apply_pixel_mapper()`, which then presents you with a canvas
 /// that has the new "visible width" and "visible height".
 pub(crate) enum PixelMapper {
-    Multiplex(Box<dyn MultiplexMapper>),
+    Multiplex(MultiplexMapper),
     Named(Box<dyn NamedPixelMapper>),
 }
 

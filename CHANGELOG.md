@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Fix a panic when a pixel mapper makes the canvas taller than six panels, e.g. `Rotate:90` on a long chain or a 1:4 multiplexer with parallel chains.
+- Support the `AdafruitHat`, `Classic` and `ClassicPi1` hardware mappings, which panicked because their output enable pin can't be driven by the PWM hardware. They now use timer based pulses.
+- Only claim the GPIO pins of the parallel chains in use. Previously, e.g. the I2C and UART pins were always turned into outputs.
+- `Canvas::set_brightness` and `Canvas::set_pwm_bits` now carry over to the canvas returned by `RGBMatrix::update_on_vsync` instead of only applying to every other frame.
+- Fix the 64 bit system timer read, which could jump by about 71 minutes when the low half overflowed.
+- Fix the `GBR` and `BRG` LED sequences, which were swapped compared to the upstream library.
+- Fix the vertical blocks of the `P8Outdoor1R1G1B` multiplexer.
+- Fix the `ABCShiftRegister` row address setter to match the upstream library.
+- Fix the `RegularPi1` hardware mapping, which used the wrong pins for red and green.
+- Send the FM6126 and FM6127 init registers most significant bit first and to all panels of the chain.
+- Fix interlaced scanning with an odd number of rows.
+- Allow negative angles for `Rotate` and reject angles that aren't multiples of 90 when creating the matrix.
+- Report invalid configurations (`pwm_bits`, `rows`, `cols`, `chain_length`, `parallel`, `refresh_rate`, `pwm_lsb_nanoseconds`) as errors instead of panicking, and report panics of the update thread during initialization with their message.
+- Fix the canvas size, centering and redundant clearing in the examples.
+
+### Changed
+
+- Share the pixel map and color lookup table between canvases and shrink the pixel map entries.
+- Leave a margin for the OS sleep jitter and busy-wait the rest, to avoid overshooting.
+
+### Breaking
+
+- New `MatrixCreationError` variants `ThreadPanicked` and `InvalidConfig`.
+
 ## Version 0.9.1
 
 ### Fixed 
