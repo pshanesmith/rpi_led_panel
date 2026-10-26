@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Added
+
+Ported from the upstream C++ library:
+
+- Multiplexers `P10Outdoor32x16QuarterScan`, `P3Outdoor64x64`, `DoubleZ`, `P4Outdoor80x40`, `ZStripe44For40x20` and `P10Outdoor1R1G1B2For40x20`.
+- Pixel mappers `V-mapper`, `StackToRow` and `Remap`.
+- The `ComputeModule` hardware mapping, limited to three parallel chains because the others use GPIO pins above 31.
+- The `B707ShiftRegister` row address setter.
+
 ### Fixed
 
 - Fix a panic when a pixel mapper makes the canvas taller than six panels, e.g. `Rotate:90` on a long chain or a 1:4 multiplexer with parallel chains.
@@ -27,6 +36,7 @@
 ### Breaking
 
 - New `MatrixCreationError` variants `ThreadPanicked` and `InvalidConfig`.
+- `NamedPixelMapperType` is no longer `Copy`, because `Remap` holds a list of panels.
 
 ## Version 0.9.1
 

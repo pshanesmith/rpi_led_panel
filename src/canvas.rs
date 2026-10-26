@@ -87,6 +87,11 @@ impl PixelDesignator {
             mask: !0u32,
         }
     }
+
+    /// Whether the pixel is connected to an LED.
+    pub(crate) fn is_used(&self) -> bool {
+        self.gpio_word != UNUSED_PIXEL
+    }
 }
 
 #[derive(Clone)]
@@ -139,14 +144,17 @@ impl PixelDesignatorMap {
         }
     }
 
+    fn position(&self, x: usize, y: usize) -> Option<usize> {
+        (x < self.width && y < self.height).then_some(y * self.width + x)
+    }
+
     pub(crate) fn get(&self, x: usize, y: usize) -> Option<&PixelDesignator> {
-        let position = (y * self.width) + x;
-        self.buffer.get(position)
+        self.position(x, y).map(|position| &self.buffer[position])
     }
 
     pub(crate) fn get_mut(&mut self, x: usize, y: usize) -> Option<&mut PixelDesignator> {
-        let position = (y * self.width) + x;
-        self.buffer.get_mut(position)
+        self.position(x, y)
+            .map(|position| &mut self.buffer[position])
     }
 
     fn get_pixel_designator(&self) -> PixelDesignator {
@@ -235,7 +243,7 @@ impl Canvas {
             mask: designator_mask,
         } = *designator;
 
-        if gpio_word == UNUSED_PIXEL {
+        if !designator.is_used() {
             return;
         }
         let pos_start = gpio_word as usize;

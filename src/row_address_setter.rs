@@ -11,6 +11,7 @@ pub enum RowAddressSetterType {
     DirectABCDLine,
     ABCShiftRegister,
     SM5266,
+    B707ShiftRegister,
 }
 
 impl RowAddressSetterType {
@@ -27,6 +28,9 @@ impl RowAddressSetterType {
                 Box::new(ABCShiftRegisterRowAddressSetter::new(config))
             }
             RowAddressSetterType::SM5266 => Box::new(SM5266RowAddressSetter::new(config)),
+            RowAddressSetterType::B707ShiftRegister => {
+                Box::new(B707ShiftRegisterRowAddressSetter::new(config))
+            }
         }
     }
 }
@@ -163,6 +167,54 @@ impl RowAddressSetter for SM5266RowAddressSetter {
         self.last_row = Some(row);
         // Set bits D and E to enable the proper shifter to display the selected row.
         gpio.write_masked_bits(self.row_lookup[row], self.row_mask);
+    }
+}
+
+/// The [`B707ShiftRegisterRowAddressSetter`] is for panels with a B707 shift register that advances by one row
+/// on every clock. A high bit is shifted in for the first row, which then moves on with every following row.
+/// BK = Enable Input, DIN = Serial In, DCK = Clock
+pub(crate) struct B707ShiftRegisterRowAddressSetter {
+    row_mask: u32,
+    last_row: Option<usize>,
+    bk: u32,
+    din: u32,
+    dck: u32,
+}
+
+impl B707ShiftRegisterRowAddressSetter {
+    pub(crate) fn new(config: &RGBMatrixConfig) -> Self {
+        let h = config.hardware_mapping;
+        assert!(config.double_rows() <= 32); // designed for up to 1/32 panel
+        Self {
+            row_mask: h.a | h.b | h.c,
+            last_row: None,
+            bk: h.b,
+            din: h.c,
+            dck: h.a,
+        }
+    }
+}
+
+impl RowAddressSetter for B707ShiftRegisterRowAddressSetter {
+    fn used_bits(&self) -> u32 {
+        self.row_mask
+    }
+
+    fn set_row_address(&mut self, gpio: &mut Gpio, row: usize) {
+        if self.last_row == Some(row) {
+            return;
+        }
+        gpio.set_bits(self.bk); // Enable serial input for the shifter.
+        if row == 0 {
+            gpio.set_bits(self.din);
+        } else {
+            gpio.clear_bits(self.din);
+        }
+        gpio.set_bits(self.dck);
+        gpio.set_bits(self.dck); // Longer clock time; tested with Pi3
+        gpio.clear_bits(self.dck);
+        gpio.clear_bits(self.bk); // Disable serial input to keep unwanted bits out of the shifters.
+        self.last_row = Some(row);
     }
 }
 

@@ -1,5 +1,6 @@
 use crate::{
-    multiplex_mapper::MultiplexMapper, named_pixel_mapper::NamedPixelMapper,
+    multiplex_mapper::MultiplexMapper,
+    named_pixel_mapper::{MappingDirection, NamedPixelMapper},
     rgb_matrix::MatrixCreationError,
 };
 
@@ -42,6 +43,29 @@ impl PixelMapper {
             }
             PixelMapper::Named(mapper) => {
                 mapper.map_visible_to_matrix(matrix_width, matrix_height, visible_x, visible_y)
+            }
+        }
+    }
+
+    pub(crate) fn mapping_direction(&self) -> MappingDirection {
+        match self {
+            PixelMapper::Multiplex(_) => MappingDirection::VisibleToMatrix,
+            PixelMapper::Named(mapper) => mapper.mapping_direction(),
+        }
+    }
+
+    /// Map where an underlying matrix pixel (x,y) is visible, if at all.
+    pub(crate) fn map_matrix_to_visible(
+        &self,
+        matrix_width: usize,
+        matrix_height: usize,
+        matrix_x: usize,
+        matrix_y: usize,
+    ) -> Option<[usize; 2]> {
+        match self {
+            PixelMapper::Multiplex(_) => None,
+            PixelMapper::Named(mapper) => {
+                mapper.map_matrix_to_visible(matrix_width, matrix_height, matrix_x, matrix_y)
             }
         }
     }

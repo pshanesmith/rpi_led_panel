@@ -106,6 +106,7 @@ impl FromStr for HardwareMapping {
             RegularPi1,
             Classic,
             ClassicPi1,
+            ComputeModule,
         }
         let mapping = HardwareMappingNames::from_str(s)?;
         match mapping {
@@ -115,6 +116,7 @@ impl FromStr for HardwareMapping {
             HardwareMappingNames::RegularPi1 => Ok(Self::regular_pi1()),
             HardwareMappingNames::Classic => Ok(Self::classic()),
             HardwareMappingNames::ClassicPi1 => Ok(Self::classic_pi1()),
+            HardwareMappingNames::ComputeModule => Ok(Self::compute_module()),
         }
     }
 }
@@ -356,6 +358,57 @@ impl HardwareMapping {
                     },
                     ColorBits::unused(),
                     ColorBits::unused(),
+                    ColorBits::unused(),
+                    ColorBits::unused(),
+                    ColorBits::unused(),
+                ],
+            },
+        }
+    }
+
+    /// Pin-out for the official Compute Module I/O development board.
+    ///
+    /// Upstream supports six parallel chains on this board, but chains 3 to 5 use GPIO pins above 31, which this
+    /// library can't drive. So up to three parallel chains are supported.
+    #[must_use]
+    pub const fn compute_module() -> Self {
+        Self {
+            output_enable: gpio_bits!(18),
+            clock: gpio_bits!(16),
+            strobe: gpio_bits!(17),
+
+            a: gpio_bits!(2),
+            b: gpio_bits!(3),
+            c: gpio_bits!(4),
+            d: gpio_bits!(5),
+            e: gpio_bits!(6),
+
+            panels: Panels {
+                color_bits: [
+                    ColorBits {
+                        r1: gpio_bits!(7),
+                        g1: gpio_bits!(8),
+                        b1: gpio_bits!(9),
+                        r2: gpio_bits!(10),
+                        g2: gpio_bits!(11),
+                        b2: gpio_bits!(12),
+                    },
+                    ColorBits {
+                        r1: gpio_bits!(13),
+                        g1: gpio_bits!(14),
+                        b1: gpio_bits!(15),
+                        r2: gpio_bits!(19),
+                        g2: gpio_bits!(20),
+                        b2: gpio_bits!(21),
+                    },
+                    ColorBits {
+                        r1: gpio_bits!(22),
+                        g1: gpio_bits!(23),
+                        b1: gpio_bits!(24),
+                        r2: gpio_bits!(25),
+                        g2: gpio_bits!(26),
+                        b2: gpio_bits!(27),
+                    },
                     ColorBits::unused(),
                     ColorBits::unused(),
                     ColorBits::unused(),

@@ -19,6 +19,7 @@ use crate::{
     chip::PiChip,
     config::K_BIT_PLANES,
     gpio::{Gpio, GpioInitializationError},
+    named_pixel_mapper::MappingDirection,
     pixel_mapper::PixelMapper,
     utils::{FrameRateMonitor, linux_has_isol_cpu, set_thread_affinity},
 };
@@ -402,16 +403,45 @@ impl RGBMatrix {
         let old_height = shared_mapper.height();
         let [new_width, new_height] = mapper.get_size_mapping(old_width, old_height)?;
         let mut new_mapper = PixelDesignatorMap::blank(pixel_designator, new_width, new_height);
-        for y in 0..new_height {
-            for x in 0..new_width {
-                let [orig_x, orig_y] = mapper.map_visible_to_matrix(old_width, old_height, x, y);
-                if orig_x >= old_width || orig_y >= old_height {
-                    return Err(MatrixCreationError::PixelMapperError(
-                        "Invalid dimensions detected. This is likely a bug.".to_string(),
-                    ));
+        let invalid_dimensions = || {
+            MatrixCreationError::PixelMapperError(
+                "Invalid dimensions detected. This is likely a bug.".to_string(),
+            )
+        };
+        match mapper.mapping_direction() {
+            MappingDirection::VisibleToMatrix => {
+                for y in 0..new_height {
+                    for x in 0..new_width {
+                        let [orig_x, orig_y] =
+                            mapper.map_visible_to_matrix(old_width, old_height, x, y);
+                        let orig_designator = shared_mapper
+                            .get(orig_x, orig_y)
+                            .ok_or_else(invalid_dimensions)?;
+                        *new_mapper.get_mut(x, y).unwrap() = *orig_designator;
+                    }
                 }
-                let orig_designator = shared_mapper.get(orig_x, orig_y).unwrap();
-                *new_mapper.get_mut(x, y).unwrap() = *orig_designator;
+            }
+            MappingDirection::MatrixToVisible => {
+                let mut collision_reported = false;
+                for y in 0..old_height {
+                    for x in 0..old_width {
+                        let Some([new_x, new_y]) =
+                            mapper.map_matrix_to_visible(old_width, old_height, x, y)
+                        else {
+                            continue;
+                        };
+                        let new_designator = new_mapper
+                            .get_mut(new_x, new_y)
+                            .ok_or_else(invalid_dimensions)?;
+                        if new_designator.is_used() && !collision_reported {
+                            eprintln!(
+                                "Warning: pixel mapper maps more than one pixel to ({new_x}, {new_y})."
+                            );
+                            collision_reported = true;
+                        }
+                        *new_designator = *shared_mapper.get(x, y).unwrap();
+                    }
+                }
             }
         }
         Ok(new_mapper)
@@ -513,6 +543,47 @@ mod tests {
         };
         let map = RGBMatrix::create_pixel_map(&mut config).unwrap();
         assert_eq!((map.width(), map.height()), (32, 32));
+    }
+
+    #[test]
+    fn remaps_every_pixel_once() {
+        let mut config = RGBMatrixConfig {
+            rows: 16,
+            cols: 32,
+            chain_length: 2,
+            pixelmapper: vec!["Remap:32,32|0,0n|0,16s".parse().unwrap()],
+            ..Default::default()
+        };
+        let map = RGBMatrix::create_pixel_map(&mut config).unwrap();
+        assert_eq!((map.width(), map.height()), (32, 32));
+        for y in 0..32 {
+            for x in 0..32 {
+                assert!(map.get(x, y).unwrap().is_used(), "({x}, {y}) is not mapped");
+            }
+        }
+    }
+
+    #[test]
+    fn creates_maps_for_new_multiplexers() {
+        for (multiplexing, rows, cols) in [
+            (MultiplexMapperType::P10Outdoor32x16QuarterScan, 16, 32),
+            (MultiplexMapperType::P3Outdoor64x64, 64, 64),
+            (MultiplexMapperType::DoubleZ, 32, 64),
+            (MultiplexMapperType::P4Outdoor80x40, 40, 80),
+            (MultiplexMapperType::ZStripe44For40x20, 20, 40),
+            (MultiplexMapperType::P10Outdoor1R1G1B2For40x20, 20, 40),
+        ] {
+            let mut config = RGBMatrixConfig {
+                rows,
+                cols,
+                multiplexing: Some(multiplexing),
+                ..Default::default()
+            };
+            assert!(
+                RGBMatrix::create_pixel_map(&mut config).is_ok(),
+                "{multiplexing:?}"
+            );
+        }
     }
 
     #[test]
