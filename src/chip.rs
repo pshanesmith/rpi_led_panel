@@ -17,6 +17,9 @@ pub enum PiChip {
     /// Model 4
     #[strum(serialize = "BCM2711")]
     BCM2711,
+    /// Model 5, whose GPIO pins are connected to the RP1 I/O controller.
+    #[strum(serialize = "BCM2712")]
+    BCM2712,
 }
 
 /// Reads the hexadecimal revision code from the "Revision" line of /proc/cpuinfo.
@@ -62,6 +65,8 @@ impl PiChip {
             2 => Some(Self::BCM2709),
             // BCM2711
             3 => Some(Self::BCM2711),
+            // BCM2712
+            4 => Some(Self::BCM2712),
             _ => None,
         }
     }
@@ -69,22 +74,29 @@ impl PiChip {
     pub(crate) const fn num_cores(self) -> usize {
         match self {
             PiChip::BCM2708 => 1,
-            PiChip::BCM2709 | PiChip::BCM2711 => 4,
+            PiChip::BCM2709 | PiChip::BCM2711 | PiChip::BCM2712 => 4,
         }
     }
 
-    // All peripherals can be described by an offset from the Peripheral Base Address.
-    pub(crate) const fn get_peripherals_base(self) -> u64 {
+    /// Whether the GPIO pins are driven through the RP1 I/O controller instead of the chip's own peripherals.
+    pub(crate) const fn uses_rp1(self) -> bool {
+        matches!(self, PiChip::BCM2712)
+    }
+
+    /// All peripherals can be described by an offset from the Peripheral Base Address. The GPIO pins of the
+    /// BCM2712 are not among them.
+    pub(crate) const fn get_peripherals_base(self) -> Option<u64> {
         match self {
-            PiChip::BCM2708 => 0x2000_0000,
-            PiChip::BCM2709 => 0x3F00_0000,
-            PiChip::BCM2711 => 0xFE00_0000,
+            PiChip::BCM2708 => Some(0x2000_0000),
+            PiChip::BCM2709 => Some(0x3F00_0000),
+            PiChip::BCM2711 => Some(0xFE00_0000),
+            PiChip::BCM2712 => None,
         }
     }
 
-    pub(crate) fn gpio_slowdown(self) -> u32 {
+    pub(crate) fn gpio_slowdown(self) -> i32 {
         match self {
-            PiChip::BCM2708 | PiChip::BCM2709 => 1,
+            PiChip::BCM2708 | PiChip::BCM2709 | PiChip::BCM2712 => 1,
             PiChip::BCM2711 => 3,
         }
     }
@@ -105,7 +117,9 @@ mod tests {
         assert_eq!(chip("Revision\t: a02082"), Some(PiChip::BCM2709)); // 3B
         assert_eq!(chip("Revision\t: 902120"), Some(PiChip::BCM2709)); // Zero 2 W
         assert_eq!(chip("Revision\t: c03111"), Some(PiChip::BCM2711)); // 4B
-        assert_eq!(chip("Revision\t: c04170"), None); // 5, not supported
+        assert_eq!(chip("Revision\t: c04170"), Some(PiChip::BCM2712)); // 5B
+        assert_eq!(chip("Revision\t: d04190"), Some(PiChip::BCM2712)); // 500
+        assert_eq!(chip("Revision\t: c05170"), None); // Unknown processor
         assert_eq!(revision_from_cpuinfo("CPU revision\t: 3"), None);
     }
 }

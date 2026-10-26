@@ -1,5 +1,6 @@
 use crate::{
     gpio_bits,
+    hardware_mapping::GpioBits,
     registers::{ClkRegisters, GPIOFunction, GPIORegisters, PWMRegisters, TimeRegisters},
     utils::sleep_at_most,
 };
@@ -7,7 +8,7 @@ use crate::{
 const PWM_BASE_TIME_NS: u32 = 2;
 
 /// Output enable pins that can be driven by the PWM hardware.
-pub(crate) const HARDWARE_PULSE_PINS: [u32; 2] = [gpio_bits!(18), gpio_bits!(12)];
+pub(crate) const HARDWARE_PULSE_PINS: [GpioBits; 2] = [gpio_bits!(18), gpio_bits!(12)];
 
 /// Generates the output enable pulses that light up the LEDs for the duration of a bit plane.
 pub(crate) enum PinPulser {
@@ -18,12 +19,12 @@ pub(crate) enum PinPulser {
 }
 
 pub(crate) struct TimerPinPulser {
-    pins: u32,
+    pins: GpioBits,
     bitplane_timings_ns: Vec<u32>,
 }
 
 impl TimerPinPulser {
-    pub(crate) fn new(pins: u32, bitplane_timings_ns: &[u32]) -> Self {
+    pub(crate) fn new(pins: GpioBits, bitplane_timings_ns: &[u32]) -> Self {
         Self {
             pins,
             bitplane_timings_ns: bitplane_timings_ns.to_vec(),
@@ -31,7 +32,7 @@ impl TimerPinPulser {
     }
 
     /// The (active low) output enable pins and how long they need to be enabled for the bit plane.
-    pub(crate) fn pulse(&self, bitplane: usize) -> (u32, u32) {
+    pub(crate) fn pulse(&self, bitplane: usize) -> (GpioBits, u32) {
         (self.pins, self.bitplane_timings_ns[bitplane])
     }
 }
@@ -52,7 +53,7 @@ pub(crate) struct HardwarePinPulser {
 
 impl HardwarePinPulser {
     pub(crate) fn new(
-        pins: u32,
+        pins: GpioBits,
         bitplane_timings_ns: &[u32],
         pwm_registers: &mut PWMRegisters,
         gpio_registers: &mut GPIORegisters,

@@ -1,3 +1,4 @@
+mod backend;
 mod canvas;
 mod chip;
 mod color;
@@ -13,6 +14,9 @@ mod pixel_mapper;
 mod registers;
 mod rgb_matrix;
 mod row_address_setter;
+mod rp1;
+mod rp1_pio;
+mod rp1_rio;
 mod utils;
 
 pub use canvas::{Canvas, LedSequence};

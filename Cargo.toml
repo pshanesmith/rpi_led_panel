@@ -24,6 +24,8 @@ name = "rotating_square"
 [features]
 default = ["drawing"]
 drawing = ["embedded-graphics"]
+# Use the GPIO pins above 31 of the Compute Module, for up to 6 parallel chains. Doubles the memory per canvas.
+wide-gpio = []
 
 [dependencies]
 argh = "0.1.19"

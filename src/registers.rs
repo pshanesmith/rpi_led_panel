@@ -1,8 +1,11 @@
-use std::{fs, rc::Rc, time};
+use std::{fs, rc::Rc, sync::Mutex};
 
 use memmap2::{MmapMut, MmapOptions};
 
-use crate::{chip::PiChip, utils::sleep_at_most};
+use crate::{
+    chip::PiChip,
+    hardware_mapping::{GpioBits, low_pins},
+};
 
 // See https://elinux.org/BCM2835_registers
 
@@ -96,26 +99,41 @@ impl GPIOFunction {
 }
 
 pub fn mmap_bcm_register(chip: PiChip, offset: u64, size_bytes: usize) -> Rc<MmapMut> {
+    Rc::new(mmap_bcm_register_unshared(chip, offset, size_bytes))
+}
+
+fn mmap_bcm_register_unshared(chip: PiChip, offset: u64, size_bytes: usize) -> MmapMut {
     let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open("/dev/mem")
         .expect("Failed to open '/dev/mem'");
-    let base = chip.get_peripherals_base();
-    let map = unsafe {
+    let base = chip
+        .get_peripherals_base()
+        .expect("The chip has no BCM peripherals for the GPIO pins.");
+    unsafe {
         MmapOptions::new()
             .offset(base + offset)
             .len(size_bytes)
             .map_mut(&file)
             .unwrap()
-    };
-    Rc::new(map)
+    }
 }
 
 pub(crate) struct GPIORegisters {
     clr0: MmapPtr<u32>,
     set0: MmapPtr<u32>,
     lvl0: MmapPtr<u32>,
+    /// The registers for the pins above 31.
+    #[cfg(feature = "wide-gpio")]
+    clr1: MmapPtr<u32>,
+    #[cfg(feature = "wide-gpio")]
+    set1: MmapPtr<u32>,
+    #[cfg(feature = "wide-gpio")]
+    lvl1: MmapPtr<u32>,
+    /// Only write the registers for the pins above 31 if they are used, as each write takes time.
+    #[cfg(feature = "wide-gpio")]
+    uses_high_bits: bool,
     function_select: GPIOFunctionSelectRegisters,
 }
 
@@ -125,31 +143,108 @@ impl GPIORegisters {
         let clr0 = MmapPtr::new(map.clone(), GP_CLR0);
         let set0 = MmapPtr::new(map.clone(), GP_SET0);
         let lvl0 = MmapPtr::new(map.clone(), GP_LEV0);
+        #[cfg(feature = "wide-gpio")]
+        let (clr1, set1, lvl1) = (
+            MmapPtr::new(map.clone(), GP_CLR0 + 4),
+            MmapPtr::new(map.clone(), GP_SET0 + 4),
+            MmapPtr::new(map.clone(), GP_LEV0 + 4),
+        );
         let function_select = GPIOFunctionSelectRegisters::new(map, GP_FSEL0);
         Self {
             clr0,
             set0,
             lvl0,
+            #[cfg(feature = "wide-gpio")]
+            clr1,
+            #[cfg(feature = "wide-gpio")]
+            set1,
+            #[cfg(feature = "wide-gpio")]
+            lvl1,
+            #[cfg(feature = "wide-gpio")]
+            uses_high_bits: false,
             function_select,
         }
     }
 
-    pub(crate) fn write_clr_bits(&mut self, value: u32) {
-        self.clr0.write(value);
+    /// Marks the pins as used, which might need the registers for the pins above 31.
+    pub(crate) fn use_bits(&mut self, _bits: GpioBits) {
+        #[cfg(feature = "wide-gpio")]
+        {
+            self.uses_high_bits |= _bits >> 32 != 0;
+        }
     }
 
-    pub(crate) fn write_set_bits(&mut self, value: u32) {
-        self.set0.write(value);
+    pub(crate) fn write_clr_bits(&mut self, value: GpioBits) {
+        self.clr0.write(low_pins(value));
+        #[cfg(feature = "wide-gpio")]
+        if self.uses_high_bits {
+            self.clr1.write((value >> 32) as u32);
+        }
+    }
+
+    pub(crate) fn write_set_bits(&mut self, value: GpioBits) {
+        self.set0.write(low_pins(value));
+        #[cfg(feature = "wide-gpio")]
+        if self.uses_high_bits {
+            self.set1.write((value >> 32) as u32);
+        }
     }
 
     pub(crate) fn select_function(&mut self, pin: u8, function: GPIOFunction) {
         self.function_select.set_function(pin, function);
     }
 
-    pub(crate) fn read_pin_level0(&self) -> u32 {
+    pub(crate) fn read_pin_levels(&self) -> GpioBits {
+        #[cfg(feature = "wide-gpio")]
+        return GpioBits::from(self.lvl0.read()) | (GpioBits::from(self.lvl1.read()) << 32);
+        #[cfg(not(feature = "wide-gpio"))]
         self.lvl0.read()
     }
 }
+
+/// The GPIO set and clear registers for the outputs that the user controls. Unlike [`GPIORegisters`], these
+/// can be used from any thread.
+pub(crate) struct UserGpioOutputs {
+    map: Mutex<MmapMut>,
+}
+
+impl UserGpioOutputs {
+    pub(crate) fn new(chip: PiChip) -> Self {
+        Self {
+            map: Mutex::new(mmap_bcm_register_unshared(chip, GP_OFFSET, GP_SIZE_BYTES)),
+        }
+    }
+
+    /// Sets the bits in `mask` to the values in `value`.
+    pub(crate) fn write_masked_bits(&self, value: u32, mask: u32) {
+        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let base = map.as_mut_ptr();
+        unsafe {
+            base.add(GP_CLR0)
+                .cast::<u32>()
+                .write_volatile(!value & mask);
+            base.add(GP_SET0).cast::<u32>().write_volatile(value & mask);
+        }
+    }
+}
+
+/// Waits until all previous writes to the GPIO registers are done.
+#[inline(always)]
+pub(crate) fn store_barrier() {
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "arm", target_feature = "v7")
+    ))]
+    unsafe {
+        std::arch::asm!("dsb st", options(nostack, preserves_flags));
+    }
+}
+
+/// Whether [`store_barrier`] does anything on this architecture.
+pub(crate) const STORE_BARRIER_SUPPORTED: bool = cfg!(any(
+    target_arch = "aarch64",
+    all(target_arch = "arm", target_feature = "v7")
+));
 
 // System Timer
 const ST_OFFSET: u64 = 0x3000;
@@ -182,14 +277,6 @@ impl TimeRegisters {
             if self.high.read() == high {
                 return (u64::from(high) << u32::BITS) | u64::from(low);
             }
-        }
-    }
-
-    pub(crate) fn sleep(&mut self, duration_us: u64) {
-        let end_time = self.get_time() + duration_us;
-        sleep_at_most(time::Duration::from_micros(duration_us));
-        while self.get_time() < end_time {
-            std::hint::spin_loop();
         }
     }
 }

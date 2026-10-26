@@ -5,9 +5,7 @@ use crate::{
     color::{CIE1931_LOOKUP, ColorLookup},
     config::K_BIT_PLANES,
     error::InvalidVariantError,
-    gpio::Gpio,
-    hardware_mapping::HardwareMapping,
-    row_address_setter::RowAddressSetter,
+    hardware_mapping::{GpioBits, HardwareMapping},
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -49,7 +47,13 @@ impl LedSequence {
     }
 
     /// Returns the GPIO bits that drive `color`: the input at the position of `color` in the sequence.
-    fn get_gpio(self, color: Color, red_bits: u32, green_bits: u32, blue_bits: u32) -> u32 {
+    fn get_gpio(
+        self,
+        color: Color,
+        red_bits: GpioBits,
+        green_bits: GpioBits,
+        blue_bits: GpioBits,
+    ) -> GpioBits {
         let inputs = [red_bits, green_bits, blue_bits];
         let position = self
             .colors()
@@ -67,10 +71,10 @@ const UNUSED_PIXEL: u32 = u32::MAX;
 pub(crate) struct PixelDesignator {
     /// Offset into the bit plane buffer, or [`UNUSED_PIXEL`].
     gpio_word: u32,
-    r_bit: u32,
-    g_bit: u32,
-    b_bit: u32,
-    mask: u32,
+    r_bit: GpioBits,
+    g_bit: GpioBits,
+    b_bit: GpioBits,
+    mask: GpioBits,
 }
 
 impl PixelDesignator {
@@ -84,7 +88,7 @@ impl PixelDesignator {
             r_bit: sequence.get_gpio(Color::Red, r, g, b),
             g_bit: sequence.get_gpio(Color::Green, r, g, b),
             b_bit: sequence.get_gpio(Color::Blue, r, g, b),
-            mask: !0u32,
+            mask: !0,
         }
     }
 
@@ -102,7 +106,7 @@ pub(crate) struct PixelDesignatorMap {
     buffer: Vec<PixelDesignator>,
     /// The bits of LEDs that no visible pixel maps to, by their offset in the first bit plane. They stay off when
     /// filling the canvas.
-    hidden_bits: Vec<(usize, u32)>,
+    hidden_bits: Vec<(usize, GpioBits)>,
 }
 
 impl PixelDesignatorMap {
@@ -158,7 +162,7 @@ impl PixelDesignatorMap {
             .map(|d| d.gpio_word as usize + 1)
             .max()
             .unwrap_or(0);
-        let mut bits = vec![0u32; len];
+        let mut bits: Vec<GpioBits> = vec![0; len];
         for d in matrix.buffer.iter().filter(used) {
             bits[d.gpio_word as usize] |= !d.mask;
         }
@@ -198,14 +202,17 @@ impl PixelDesignatorMap {
     }
 }
 
+/// A frame for the matrix. Draw to it and pass it to [`crate::RGBMatrix::update_on_vsync`] to show it.
 #[derive(Clone)]
 pub struct Canvas {
     cols: usize,
     double_rows: usize,
-    bitplane_buffer: Vec<u32>,
+    bitplane_buffer: Vec<GpioBits>,
     shared_mapper: Arc<PixelDesignatorMap>,
     pwm_bits: usize,
     brightness: u8,
+    luminance_correct: bool,
+    inverse_colors: bool,
     color_lookup: &'static ColorLookup,
     interlaced: bool,
 }
@@ -215,16 +222,23 @@ impl Canvas {
         let color_lookup = &*CIE1931_LOOKUP;
         let cols = config.cols * config.chain_length;
         let double_rows = config.double_rows();
-        Self {
+        let mut canvas = Self {
             cols,
             double_rows,
-            bitplane_buffer: vec![0u32; double_rows * cols * K_BIT_PLANES],
+            bitplane_buffer: vec![0; double_rows * cols * K_BIT_PLANES],
             shared_mapper,
             pwm_bits: config.pwm_bits.clamp(1, K_BIT_PLANES),
             brightness: config.led_brightness.clamp(1, 100),
+            luminance_correct: true,
+            inverse_colors: config.inverse_colors,
             color_lookup,
             interlaced: config.interlaced,
+        };
+        if canvas.inverse_colors {
+            // An empty buffer would light up all LEDs.
+            canvas.fill(0, 0, 0);
         }
+        canvas
     }
 
     #[must_use]
@@ -237,38 +251,73 @@ impl Canvas {
         self.shared_mapper.width
     }
 
+    /// The number of rows that are multiplexed, each of which shows one row of both sub-panels.
+    pub(crate) fn double_rows(&self) -> usize {
+        self.double_rows
+    }
+
+    /// The number of columns of the whole chain.
+    pub(crate) fn columns(&self) -> usize {
+        self.cols
+    }
+
+    /// The double row that is shown at the given position of the scan.
+    pub(crate) fn display_row(&self, row_loop: usize) -> usize {
+        if !self.interlaced {
+            return row_loop;
+        }
+        // Round up so that an odd number of rows still shows every row exactly once.
+        let half_double = self.double_rows.div_ceil(2);
+        if row_loop < half_double {
+            2 * row_loop
+        } else {
+            2 * (row_loop - half_double) + 1
+        }
+    }
+
+    /// The lowest bit plane to show. Depending on if we do dithering, we might not always show the lowest bits.
+    pub(crate) fn start_bit(&self, pwm_low_bit: usize) -> usize {
+        (K_BIT_PLANES - self.pwm_bits).max(pwm_low_bit)
+    }
+
     fn position_at(&self, double_row: usize, column: usize, bit: usize) -> usize {
         double_row * (self.cols * K_BIT_PLANES) + bit * self.cols + column
     }
 
-    fn row_at(&self, double_row: usize, column: usize, bit: usize) -> &[u32] {
+    /// The GPIO words of one bit plane of a double row, one per column.
+    pub(crate) fn row_at(&self, double_row: usize, column: usize, bit: usize) -> &[GpioBits] {
         let start = self.position_at(double_row, column, bit);
         &self.bitplane_buffer[start..start + self.cols]
     }
 
-    fn row_at_mut(&mut self, double_row: usize, column: usize, bit: usize) -> &mut [u32] {
+    fn row_at_mut(&mut self, double_row: usize, column: usize, bit: usize) -> &mut [GpioBits] {
         let start = self.position_at(double_row, column, bit);
         &mut self.bitplane_buffer[start..start + self.cols]
     }
 
-    pub fn set_pixel(&mut self, x: usize, y: usize, r: u8, g: u8, b: u8) {
-        let Some(designator) = self.shared_mapper.get(x, y) else {
-            return;
-        };
+    fn map_color(&self, r: u8, g: u8, b: u8) -> [u16; 3] {
+        self.color_lookup.map_rgb(
+            self.brightness,
+            self.luminance_correct,
+            self.inverse_colors,
+            [r, g, b],
+        )
+    }
+
+    /// Writes the mapped color to the bit planes of a pixel.
+    fn write_pixel(&mut self, designator: PixelDesignator, [red, green, blue]: [u16; 3]) {
         let PixelDesignator {
             gpio_word,
             r_bit,
             g_bit,
             b_bit,
             mask: designator_mask,
-        } = *designator;
+        } = designator;
 
         if !designator.is_used() {
             return;
         }
         let pos_start = gpio_word as usize;
-
-        let [red, green, blue] = self.color_lookup.lookup_rgb(self.brightness, r, g, b);
 
         let min_bit_plane = K_BIT_PLANES - self.pwm_bits;
 
@@ -290,90 +339,98 @@ impl Canvas {
         });
     }
 
-    pub fn fill(&mut self, r: u8, g: u8, b: u8) {
-        let designator = self.shared_mapper.get_pixel_designator();
+    pub fn set_pixel(&mut self, x: usize, y: usize, r: u8, g: u8, b: u8) {
+        let Some(&designator) = self.shared_mapper.get(x, y) else {
+            return;
+        };
+        let color = self.map_color(r, g, b);
+        self.write_pixel(designator, color);
+    }
+
+    /// Sets the pixels of the `width` x `height` rectangle at `x`, `y` to the `[r, g, b]` colors, row by row.
+    /// Pixels outside of the canvas are skipped.
+    pub fn set_pixels(
+        &mut self,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+        colors: &[[u8; 3]],
+    ) {
+        if width == 0 {
+            return;
+        }
+        for (i, &[r, g, b]) in colors.iter().take(width * height).enumerate() {
+            self.set_pixel(x + i % width, y + i / width, r, g, b);
+        }
+    }
+
+    /// Fills the `width` x `height` rectangle at `x`, `y` with one color. The part outside of the canvas is
+    /// skipped.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sub_fill(
+        &mut self,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+        r: u8,
+        g: u8,
+        b: u8,
+    ) {
+        let color = self.map_color(r, g, b);
+        let x_end = x.saturating_add(width).min(self.width());
+        let y_end = y.saturating_add(height).min(self.height());
+        let mapper = Arc::clone(&self.shared_mapper);
+        for row in y..y_end {
+            for col in x..x_end {
+                if let Some(&designator) = mapper.get(col, row) {
+                    self.write_pixel(designator, color);
+                }
+            }
+        }
+    }
+
+    /// The GPIO bits of one bit plane for the mapped color, for all pixels.
+    fn plane_bits(&self, [red, green, blue]: [u16; 3], plane: usize) -> GpioBits {
         let PixelDesignator {
             r_bit,
             g_bit,
             b_bit,
             ..
-        } = designator;
+        } = self.shared_mapper.get_pixel_designator();
+        let mask = 1 << plane;
+        let mut plane_bits = 0;
+        if (red & mask) == mask {
+            plane_bits |= r_bit;
+        };
+        if (green & mask) == mask {
+            plane_bits |= g_bit;
+        };
+        if (blue & mask) == mask {
+            plane_bits |= b_bit;
+        };
+        plane_bits
+    }
 
-        let [red, green, blue] = self.color_lookup.lookup_rgb(self.brightness, r, g, b);
+    pub fn fill(&mut self, r: u8, g: u8, b: u8) {
+        let color = self.map_color(r, g, b);
+        let black = self.map_color(0, 0, 0);
 
-        (K_BIT_PLANES - self.pwm_bits..K_BIT_PLANES).for_each(|b| {
-            let mask = 1 << b;
-            let mut plane_bits = 0;
-            if (red & mask) == mask {
-                plane_bits |= r_bit;
-            };
-            if (green & mask) == mask {
-                plane_bits |= g_bit;
-            };
-            if (blue & mask) == mask {
-                plane_bits |= b_bit;
-            };
+        (K_BIT_PLANES - self.pwm_bits..K_BIT_PLANES).for_each(|plane| {
+            let plane_bits = self.plane_bits(color, plane);
             (0..self.double_rows).for_each(|row| {
-                self.row_at_mut(row, 0, b).fill(plane_bits);
+                self.row_at_mut(row, 0, plane).fill(plane_bits);
             });
-            if plane_bits != 0 {
+            // LEDs that aren't part of the canvas stay off.
+            let off_bits = self.plane_bits(black, plane);
+            if plane_bits != off_bits {
                 for &(offset, bits) in &self.shared_mapper.hidden_bits {
-                    self.bitplane_buffer[offset + self.cols * b] &= !bits;
+                    let word = &mut self.bitplane_buffer[offset + self.cols * plane];
+                    *word = (*word & !bits) | (off_bits & bits);
                 }
             }
         });
-    }
-
-    pub(crate) fn dump_to_matrix(
-        &self,
-        gpio: &mut Gpio,
-        hardware_mapping: &HardwareMapping,
-        row_setter: &mut dyn RowAddressSetter,
-        pwm_low_bit: usize,
-        color_clk_mask: u32,
-    ) {
-        // Depending on if we do dithering, we might not always show the lowest bits.
-        let start_bit = (K_BIT_PLANES - self.pwm_bits).max(pwm_low_bit);
-
-        // Round up so that an odd number of rows still shows every row exactly once.
-        let half_double = self.double_rows.div_ceil(2);
-        for row_loop in 0..self.double_rows {
-            let d_row = if self.interlaced {
-                if row_loop < half_double {
-                    2 * row_loop
-                } else {
-                    2 * (row_loop - half_double) + 1
-                }
-            } else {
-                row_loop
-            };
-
-            // Rows can't be switched very quickly without ghosting, so we do the
-            // full PWM of one row before switching rows.
-            for b in start_bit..K_BIT_PLANES {
-                // While the output enable is still on, we can already clock in the next data.
-                let row = self.row_at(d_row, 0, b);
-                row.iter().for_each(|col| {
-                    gpio.write_masked_bits(*col, color_clk_mask); // col + reset clock
-                    gpio.set_bits(hardware_mapping.clock); // Rising edge: clock color in.
-                });
-
-                gpio.clear_bits(color_clk_mask); // clock back to normal.
-
-                // OE of the previous row-data must be finished before strobe.
-                gpio.wait_pulse_finished();
-
-                // Setting address and strobing needs to happen in dark time.
-                row_setter.set_row_address(gpio, d_row);
-
-                // Strobe in the previously clocked in row.
-                gpio.set_bits(hardware_mapping.strobe);
-                gpio.clear_bits(hardware_mapping.strobe);
-
-                // Now switch on for the sleep time necessary for that bit-plane.
-                gpio.send_pulse(b);
-            }
-        }
     }
 
     /// Set PWM bits used for output, between 1 and 11. Default is 11, but if you only deal with simple
@@ -382,10 +439,12 @@ impl Canvas {
     /// The setting carries over to the canvases returned by [`crate::RGBMatrix::update_on_vsync`].
     pub fn set_pwm_bits(&mut self, pwm_bits: usize) {
         let pwm_bits = pwm_bits.clamp(1, K_BIT_PLANES);
-        // Planes that become visible may still hold data from long ago.
+        // Planes that become visible may still hold data from long ago, so turn them off.
+        let black = self.map_color(0, 0, 0);
         for plane in K_BIT_PLANES - pwm_bits..K_BIT_PLANES - self.pwm_bits.min(pwm_bits) {
+            let off_bits = self.plane_bits(black, plane);
             for row in 0..self.double_rows {
-                self.row_at_mut(row, 0, plane).fill(0);
+                self.row_at_mut(row, 0, plane).fill(off_bits);
             }
         }
         self.pwm_bits = pwm_bits;
@@ -407,6 +466,52 @@ impl Canvas {
     pub fn brightness(&self) -> u8 {
         self.brightness
     }
+
+    /// Turn the CIE1931 luminance correction on or off. It is on by default and makes the brightness steps
+    /// look even to the eye. Only affects pixels drawn afterwards.
+    ///
+    /// The setting carries over to the canvases returned by [`crate::RGBMatrix::update_on_vsync`].
+    pub fn set_luminance_correct(&mut self, on: bool) {
+        self.luminance_correct = on;
+    }
+
+    #[must_use]
+    pub fn luminance_correct(&self) -> bool {
+        self.luminance_correct
+    }
+
+    /// The raw content of the canvas, e.g. to store a frame and show it again later with
+    /// [`Canvas::deserialize`]. It is only valid for canvases of matrices with the same configuration.
+    #[must_use]
+    pub fn serialize(&self) -> Vec<u8> {
+        self.bitplane_buffer
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect()
+    }
+
+    /// Restores the content from [`Canvas::serialize`]. Returns `false` and leaves the canvas unchanged if the
+    /// data has the wrong size.
+    pub fn deserialize(&mut self, data: &[u8]) -> bool {
+        const WORD_BYTES: usize = size_of::<GpioBits>();
+        if data.len() != self.bitplane_buffer.len() * WORD_BYTES {
+            return false;
+        }
+        let (words, _) = data.as_chunks::<WORD_BYTES>();
+        for (word, bytes) in self.bitplane_buffer.iter_mut().zip(words) {
+            *word = GpioBits::from_le_bytes(*bytes);
+        }
+        true
+    }
+
+    /// Copies the content of another canvas of the same matrix.
+    ///
+    /// # Panics
+    ///
+    /// If the canvases have different sizes.
+    pub fn copy_from(&mut self, other: &Canvas) {
+        self.bitplane_buffer.copy_from_slice(&other.bitplane_buffer);
+    }
 }
 
 #[cfg(feature = "drawing")]
@@ -416,7 +521,8 @@ pub mod embedded_graphics_support {
         Pixel,
         draw_target::DrawTarget,
         pixelcolor::Rgb888,
-        prelude::{OriginDimensions, RgbColor, Size},
+        prelude::{Dimensions, OriginDimensions, RgbColor, Size},
+        primitives::Rectangle,
     };
 
     impl OriginDimensions for Canvas {
@@ -449,6 +555,27 @@ pub mod embedded_graphics_support {
                     );
                 }
             }
+            Ok(())
+        }
+
+        fn fill_solid(&mut self, area: &Rectangle, color: Self::Color) -> Result<(), Self::Error> {
+            // Only the part of the area on the canvas is drawn.
+            let area = area.intersection(&self.bounding_box());
+            let (Some(x), Some(y)) = (
+                usize::try_from(area.top_left.x).ok(),
+                usize::try_from(area.top_left.y).ok(),
+            ) else {
+                return Ok(());
+            };
+            self.sub_fill(
+                x,
+                y,
+                area.size.width as usize,
+                area.size.height as usize,
+                color.r(),
+                color.g(),
+                color.b(),
+            );
             Ok(())
         }
 
@@ -517,6 +644,70 @@ mod tests {
             assert!(row[..32].iter().all(|word| word & chain_bits == 0));
             assert!(row[32..].iter().all(|word| word & chain_bits == chain_bits));
         }
+    }
+
+    #[test]
+    fn inverse_colors_keep_black_leds_off() {
+        let config = RGBMatrixConfig {
+            inverse_colors: true,
+            ..Default::default()
+        };
+        let mut canvas = canvas(&config);
+        let red = config.hardware_mapping.panels.color_bits[0].r1;
+        // Black is a high signal on all color lines, from the start.
+        assert!(canvas.row_at(0, 0, 10).iter().all(|word| word & red == red));
+        canvas.set_pixel(0, 0, 255, 0, 0);
+        assert_eq!(canvas.row_at(0, 0, 10)[0] & red, 0);
+    }
+
+    #[test]
+    fn sub_fill_and_set_pixels_match_set_pixel() {
+        let config = RGBMatrixConfig::default();
+        let mut expected = canvas(&config);
+        for (x, y) in [(2, 3), (3, 3), (2, 4), (3, 4)] {
+            expected.set_pixel(x, y, 10, 20, 30);
+        }
+        let mut filled = canvas(&config);
+        filled.sub_fill(2, 3, 2, 2, 10, 20, 30);
+        assert_eq!(filled.serialize(), expected.serialize());
+        let mut set = canvas(&config);
+        set.set_pixels(2, 3, 2, 2, &[[10, 20, 30]; 4]);
+        assert_eq!(set.serialize(), expected.serialize());
+        // Clipped at the edge of the canvas.
+        let mut clipped = canvas(&config);
+        clipped.sub_fill(62, 62, 10, 10, 255, 255, 255);
+        clipped.set_pixels(62, 0, 4, 1, &[[255, 255, 255]; 4]);
+    }
+
+    #[test]
+    fn serializes_and_copies() {
+        let config = RGBMatrixConfig::default();
+        let mut original = canvas(&config);
+        original.set_pixel(5, 6, 1, 2, 3);
+        let data = original.serialize();
+        let mut restored = canvas(&config);
+        assert!(restored.deserialize(&data));
+        assert_eq!(restored.serialize(), data);
+        assert!(!restored.deserialize(&data[1..]));
+        let mut copy = canvas(&config);
+        copy.copy_from(&original);
+        assert_eq!(copy.serialize(), data);
+    }
+
+    #[test]
+    fn luminance_correction_can_be_turned_off() {
+        let config = RGBMatrixConfig::default();
+        let mut canvas = canvas(&config);
+        let red = config.hardware_mapping.panels.color_bits[0].r1;
+        // 128 is 1024 without correction, which only sets the highest bit plane.
+        canvas.set_luminance_correct(false);
+        canvas.set_pixel(0, 0, 128, 0, 0);
+        assert_eq!(canvas.row_at(0, 0, 10)[0] & red, red);
+        assert_eq!(canvas.row_at(0, 0, 9)[0] & red, 0);
+        // With correction, it is much darker.
+        canvas.set_luminance_correct(true);
+        canvas.set_pixel(0, 0, 128, 0, 0);
+        assert_eq!(canvas.row_at(0, 0, 10)[0] & red, 0);
     }
 
     #[test]

@@ -52,10 +52,17 @@ pub struct RGBMatrixConfig {
     /// case, you want to slow down writing to GPIO. Zero for this parameter means 'no slowdown'. The default
     /// 1 typically works fine, but often you have to even go further by setting it to 2. If you have a
     /// Raspberry Pi with a slower processor (Model A, A+, B+, Zero), then a value of 0 might work and is
-    /// desirable. A Raspberry Pi3 or Pi4 might even need higher values for the panels to be happy.
+    /// desirable. A Raspberry Pi3 or Pi4 might even need higher values for the panels to be happy. On ARMv7 and
+    /// newer, -1 waits for a memory barrier instead, which can be faster than 1 while still being stable. On a
+    /// Raspberry Pi 5, this divides the pixel clock instead. Values between -1 and 60 are allowed.
     /// Default: automatic
     #[argh(option)]
-    pub slowdown: Option<u32>,
+    pub slowdown: Option<i32>,
+    /// use the PWM hardware for exact timing of the LED on-time. This requires the output enable to be on GPIO 18
+    /// or 12, otherwise the timing is done in software. Turn it off if the hardware PWM is needed for something
+    /// else, like sound. Default: true
+    #[argh(option, default = "true")]
+    pub hardware_pulse: bool,
     /// interlaced scan mode. Default: false
     #[argh(option, default = "false")]
     pub interlaced: bool,
@@ -92,6 +99,20 @@ pub struct RGBMatrixConfig {
     /// brightness in percent. Default: 100
     #[argh(option, default = "100")]
     pub led_brightness: u8,
+    /// invert all colors, for panels that light up the LEDs on a low signal. Default: false
+    #[argh(option, default = "false")]
+    pub inverse_colors: bool,
+    /// print the refresh rate to the terminal. Default: false
+    #[argh(option, default = "false")]
+    pub show_refresh: bool,
+    /// busy-wait for the end of the frame to get exact refresh rates. Turning this off reduces the CPU usage, but
+    /// makes the refresh rate less stable. Default: true
+    #[argh(option, default = "true")]
+    pub busy_waiting: bool,
+    /// on a Raspberry Pi 5, use the PIO state machine of the RP1 I/O controller to clock out the data, instead of
+    /// setting the GPIO pins from the CPU. This needs the kernel's PIO driver (/dev/pio0). Default: false
+    #[argh(option, default = "false")]
+    pub rp1_pio: bool,
     /// drop privileges from root after initialization. Default: true
     #[argh(option, default = "true")]
     pub drop_privs: bool,
@@ -107,6 +128,18 @@ impl RGBMatrixConfig {
     pub(crate) const fn double_rows(&self) -> usize {
         self.rows / SUB_PANELS
     }
+
+    /// How long the LEDs are on for each bit plane. The lowest bits are dithered and show for the same time.
+    pub(crate) fn bitplane_timings_ns(&self) -> [u32; K_BIT_PLANES] {
+        let mut timing_ns = self.pwm_lsb_nanoseconds;
+        std::array::from_fn(|b| {
+            let timing = timing_ns;
+            if b >= self.dither_bits {
+                timing_ns *= 2;
+            }
+            timing
+        })
+    }
 }
 
 impl Default for RGBMatrixConfig {
@@ -120,6 +153,7 @@ impl Default for RGBMatrixConfig {
             pwm_bits: 11,
             pwm_lsb_nanoseconds: 130,
             slowdown: None,
+            hardware_pulse: true,
             interlaced: false,
             dither_bits: 0,
             chain_length: 1,
@@ -130,6 +164,10 @@ impl Default for RGBMatrixConfig {
             row_setter: RowAddressSetterType::Direct,
             led_sequence: LedSequence::Rgb,
             led_brightness: 100,
+            inverse_colors: false,
+            show_refresh: false,
+            busy_waiting: true,
+            rp1_pio: false,
             drop_privs: true,
             drop_priv_user: String::from("daemon"),
             drop_priv_group: String::from("daemon"),

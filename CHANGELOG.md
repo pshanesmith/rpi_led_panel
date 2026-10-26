@@ -6,10 +6,19 @@
 
 Ported from the upstream C++ library:
 
+- Raspberry Pi 5 support through the RP1 I/O controller, with the RIO backend that sets the pins from the CPU, and
+  the PIO backend that clocks out the data with a PIO state machine (`--rp1-pio true`).
 - Multiplexers `P10Outdoor32x16QuarterScan`, `P3Outdoor64x64`, `DoubleZ`, `P4Outdoor80x40`, `ZStripe44For40x20` and `P10Outdoor1R1G1B2For40x20`.
 - Pixel mappers `V-mapper`, `StackToRow` and `Remap`.
-- The `ComputeModule` hardware mapping, limited to three parallel chains because the others use GPIO pins above 31.
+- The `ComputeModule` hardware mapping, with all 6 parallel chains when the new `wide-gpio` feature is enabled.
 - The `B707ShiftRegister` row address setter.
+- The options `hardware_pulse` (turn off the PWM hardware pulses), `inverse_colors`, `show_refresh` and
+  `busy_waiting`, and `slowdown -1` to wait for a memory barrier.
+- `RGBMatrix::update_on_vsync_every` to show each canvas for a multiple of frames, and `RGBMatrix::request_outputs`
+  and `RGBMatrix::output_gpio` for GPIO outputs of the user.
+- `Canvas::set_pixels`, `Canvas::sub_fill`, `Canvas::serialize`, `Canvas::deserialize`, `Canvas::copy_from` and
+  `Canvas::set_luminance_correct`. Solid fills with embedded-graphics use `sub_fill`.
+- `FM6126A` as a name for the `FM6126` panel type.
 
 ### Fixed
 
@@ -40,6 +49,10 @@ Ported from the upstream C++ library:
 
 ### Changed
 
+- The colors are rounded like upstream, instead of rounded down.
+- The frame rate is timed with the monotonic clock instead of the system timer of the BCM chips.
+- Privileges are only dropped when running as root.
+
 - Share the pixel map and color lookup table between canvases and shrink the pixel map entries.
 - Leave a margin for the OS sleep jitter and busy-wait the rest, to avoid overshooting.
 
@@ -47,6 +60,8 @@ Ported from the upstream C++ library:
 
 - New `MatrixCreationError` variants `ThreadPanicked` and `InvalidConfig`.
 - `NamedPixelMapperType` is no longer `Copy`, because `Remap` holds a list of panels.
+- `RGBMatrixConfig::slowdown` is an `i32`, to allow -1, and `RGBMatrixConfig` has new fields.
+- New `PiChip::BCM2712` and `GpioInitializationError::Rp1Pio` variants.
 
 ## Version 0.9.1
 
