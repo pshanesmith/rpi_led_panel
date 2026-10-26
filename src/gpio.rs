@@ -6,19 +6,29 @@ use std::{
 use crate::{
     RGBMatrixConfig,
     chip::PiChip,
-    config::K_BIT_PLANES,
     gpio_bits,
+    hardware_mapping::GpioBits,
     pin_pulser::{HARDWARE_PULSE_PINS, HardwarePinPulser, PinPulser, TimerPinPulser},
-    registers::{ClkRegisters, GPIOFunction, GPIORegisters, PWMRegisters, TimeRegisters},
+    registers::{
+        ClkRegisters, GPIOFunction, GPIORegisters, PWMRegisters, TimeRegisters, store_barrier,
+    },
     row_address_setter::RowAddressSetter,
-    utils::{drop_privs, linux_has_module_loaded, sleep_nanos},
+    utils::{linux_has_module_loaded, sleep_nanos},
 };
+
+/// The highest GPIO pin that can be used.
+#[cfg(not(feature = "wide-gpio"))]
+const MAX_AVAILABLE_BIT: u8 = 31;
+#[cfg(feature = "wide-gpio")]
+const MAX_AVAILABLE_BIT: u8 = 45;
 
 #[derive(Debug)]
 pub enum GpioInitializationError {
     OneWireProtocolEnabled,
     SoundModuleLoaded,
     FailedPrivilegeDrop(String),
+    /// The PIO state machine of the Raspberry Pi 5 could not be set up or used.
+    Rp1Pio(String),
 }
 
 impl Error for GpioInitializationError {}
@@ -41,6 +51,7 @@ impl Display for GpioInitializationError {
             GpioInitializationError::FailedPrivilegeDrop(e) => {
                 f.write_str(&format!("Failed to drop privileges. Reason: {}", e))
             }
+            GpioInitializationError::Rp1Pio(message) => f.write_str(message),
         }
     }
 }
@@ -50,15 +61,15 @@ pub(crate) struct Gpio {
     time_registers: TimeRegisters,
     pwm_registers: PWMRegisters,
     pin_pulser: PinPulser,
-    input_bits: u32,
-    output_bits: u32,
-    reserved_bits: u32,
-    gpio_slowdown: u32,
+    input_bits: GpioBits,
+    output_bits: GpioBits,
+    reserved_bits: GpioBits,
+    /// How many extra writes to wait after each GPIO change, or -1 to wait for a memory barrier.
+    gpio_slowdown: i32,
 }
 
 impl Gpio {
     /// Initialize GPIO and loads all registers. Needs root privileges.
-    /// Will result in the application dropping those privileges if privilege dropping is enabled in the config.
     pub(crate) fn new(
         chip: PiChip,
         config: &RGBMatrixConfig,
@@ -73,16 +84,8 @@ impl Gpio {
         let mut pwm_registers = PWMRegisters::new(chip);
         let mut clk_registers = ClkRegisters::new(chip);
 
-        // Drop privileges here as we no longer need root.
-        if config.drop_privs {
-            let res = drop_privs(&config.drop_priv_user, &config.drop_priv_group);
-            if let Err(s) = res {
-                return Err(GpioInitializationError::FailedPrivilegeDrop(s));
-            }
-        }
-
         // Tell GPIO about all bits we intend to use.
-        let mut all_used_bits: u32 = 0;
+        let mut all_used_bits: GpioBits = 0;
         all_used_bits |= config.hardware_mapping.used_bits(config.parallel);
         all_used_bits |= address_setter.used_bits();
 
@@ -116,26 +119,19 @@ impl Gpio {
                 return Err(GpioInitializationError::OneWireProtocolEnabled);
             }
 
-            let k_max_available_bit = 31;
-            (0..=k_max_available_bit).for_each(|b| {
+            (0..=MAX_AVAILABLE_BIT).for_each(|b| {
                 if output_bits & gpio_bits!(b) != 0 {
                     gpio_registers.select_function(b, GPIOFunction::Output);
                 }
             });
+            gpio_registers.use_bits(output_bits);
         }
         assert!(output_bits == all_used_bits);
 
-        let mut bitplane_timings = Vec::new();
-        let mut timing_ns = config.pwm_lsb_nanoseconds;
-        (0..K_BIT_PLANES).for_each(|b| {
-            bitplane_timings.push(timing_ns);
-            if b >= config.dither_bits {
-                timing_ns *= 2;
-            };
-        });
+        let bitplane_timings = config.bitplane_timings_ns();
 
         let output_enable = config.hardware_mapping.output_enable;
-        let pin_pulser = if HARDWARE_PULSE_PINS.contains(&output_enable) {
+        let pin_pulser = if config.hardware_pulse && HARDWARE_PULSE_PINS.contains(&output_enable) {
             PinPulser::Hardware(HardwarePinPulser::new(
                 output_enable,
                 &bitplane_timings,
@@ -163,26 +159,37 @@ impl Gpio {
         })
     }
 
-    pub(crate) fn write_masked_bits(&mut self, value: u32, mask: u32) {
+    pub(crate) fn write_masked_bits(&mut self, value: GpioBits, mask: GpioBits) {
         self.clear_bits(!value & mask);
         self.set_bits(value & mask);
     }
 
-    pub(crate) fn clear_bits(&mut self, value: u32) {
+    pub(crate) fn clear_bits(&mut self, value: GpioBits) {
         if value == 0 {
             return;
         };
-        for _ in 0..=self.gpio_slowdown {
-            self.gpio_registers.write_clr_bits(value);
-        }
+        self.gpio_registers.write_clr_bits(value);
+        self.delay();
     }
 
-    pub(crate) fn set_bits(&mut self, value: u32) {
+    pub(crate) fn set_bits(&mut self, value: GpioBits) {
         if value == 0 {
             return;
         };
-        for _ in 0..=self.gpio_slowdown {
-            self.gpio_registers.write_set_bits(value);
+        self.gpio_registers.write_set_bits(value);
+        self.delay();
+    }
+
+    /// Gives slow panels time to see the change.
+    #[inline]
+    fn delay(&mut self) {
+        if self.gpio_slowdown < 0 {
+            store_barrier();
+            return;
+        }
+        // Writing nothing to a register takes as long as a real write.
+        for _ in 0..self.gpio_slowdown {
+            self.gpio_registers.write_clr_bits(0);
         }
     }
 
@@ -219,12 +226,11 @@ impl Gpio {
         }
     }
 
-    pub(crate) fn request_enabled_inputs(&mut self, mut enabled_bits: u32) -> u32 {
+    pub(crate) fn request_enabled_inputs(&mut self, mut enabled_bits: GpioBits) -> GpioBits {
         // Remove the bits that are already used otherwise.
         enabled_bits &= !(self.output_bits | self.input_bits | self.reserved_bits);
 
-        let k_max_available_bit = 31;
-        (0..=k_max_available_bit).for_each(|b| {
+        (0..=MAX_AVAILABLE_BIT).for_each(|b| {
             if (enabled_bits & gpio_bits!(b)) != 0 {
                 self.gpio_registers.select_function(b, GPIOFunction::Input);
             }
@@ -233,17 +239,20 @@ impl Gpio {
         enabled_bits
     }
 
-    pub(crate) fn read(&mut self) -> u32 {
-        self.gpio_registers.read_pin_level0() & self.input_bits
+    /// Turns the requested pins that aren't used otherwise into outputs and returns them.
+    pub(crate) fn request_outputs(&mut self, mut requested_bits: GpioBits) -> GpioBits {
+        requested_bits &= !(self.output_bits | self.input_bits | self.reserved_bits);
+        (0..=MAX_AVAILABLE_BIT).for_each(|b| {
+            if requested_bits & gpio_bits!(b) != 0 {
+                self.gpio_registers.select_function(b, GPIOFunction::Output);
+            }
+        });
+        self.gpio_registers.use_bits(requested_bits);
+        self.output_bits |= requested_bits;
+        requested_bits
     }
 
-    /// Time instant in microseconds.
-    pub(crate) fn get_time(&self) -> u64 {
-        self.time_registers.get_time()
-    }
-
-    /// Sleep for exactly this many microseconds.
-    pub(crate) fn sleep(&mut self, duration_us: u64) {
-        self.time_registers.sleep(duration_us);
+    pub(crate) fn read(&mut self) -> GpioBits {
+        self.gpio_registers.read_pin_levels() & self.input_bits
     }
 }

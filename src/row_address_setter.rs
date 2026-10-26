@@ -1,4 +1,4 @@
-use crate::{RGBMatrixConfig, error::InvalidVariantError, gpio::Gpio};
+use crate::{RGBMatrixConfig, error::InvalidVariantError, gpio::Gpio, hardware_mapping::GpioBits};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::EnumString, strum::VariantNames)]
 #[strum(
@@ -37,13 +37,13 @@ impl RowAddressSetterType {
 
 /// Different panel types use different techniques to set the row address.
 pub(crate) trait RowAddressSetter {
-    fn used_bits(&self) -> u32;
+    fn used_bits(&self) -> GpioBits;
     fn set_row_address(&mut self, gpio: &mut Gpio, row: usize);
 }
 
 pub(crate) struct DirectRowAddressSetter {
-    row_mask: u32,
-    row_lookup: [u32; 32],
+    row_mask: GpioBits,
+    row_lookup: [GpioBits; 32],
     last_row: Option<usize>,
 }
 
@@ -60,7 +60,7 @@ impl DirectRowAddressSetter {
         row_mask |= if double_rows > 8 { h.d } else { 0 };
         row_mask |= if double_rows > 16 { h.e } else { 0 };
 
-        let mut row_lookup = [0u32; 32];
+        let mut row_lookup = [0; 32];
         (0..double_rows).for_each(|i| {
             // To avoid the bit-fiddle in the critical path, utilize
             // a lookup-table for all possible rows.
@@ -82,7 +82,7 @@ impl DirectRowAddressSetter {
 }
 
 impl RowAddressSetter for DirectRowAddressSetter {
-    fn used_bits(&self) -> u32 {
+    fn used_bits(&self) -> GpioBits {
         self.row_mask
     }
 
@@ -106,12 +106,12 @@ impl RowAddressSetter for DirectRowAddressSetter {
 /// BK, DIN and DCK are the designations on the SM5266P datasheet.
 /// BK = Enable Input, DIN = Serial In, DCK = Clock
 pub(crate) struct SM5266RowAddressSetter {
-    row_mask: u32,
-    row_lookup: [u32; 32],
+    row_mask: GpioBits,
+    row_lookup: [GpioBits; 32],
     last_row: Option<usize>,
-    bk: u32,
-    din: u32,
-    dck: u32,
+    bk: GpioBits,
+    din: GpioBits,
+    dck: GpioBits,
 }
 
 impl SM5266RowAddressSetter {
@@ -125,7 +125,7 @@ impl SM5266RowAddressSetter {
         if config.double_rows() > 16 {
             row_mask |= h.e;
         }
-        let mut row_lookup = [0u32; 32];
+        let mut row_lookup = [0; 32];
         (0..config.double_rows()).for_each(|i| {
             let mut row_address = 0;
             row_address |= if i & 0x08 != 0 { h.d } else { 0 };
@@ -144,7 +144,7 @@ impl SM5266RowAddressSetter {
 }
 
 impl RowAddressSetter for SM5266RowAddressSetter {
-    fn used_bits(&self) -> u32 {
+    fn used_bits(&self) -> GpioBits {
         self.row_mask
     }
 
@@ -174,11 +174,11 @@ impl RowAddressSetter for SM5266RowAddressSetter {
 /// on every clock. A high bit is shifted in for the first row, which then moves on with every following row.
 /// BK = Enable Input, DIN = Serial In, DCK = Clock
 pub(crate) struct B707ShiftRegisterRowAddressSetter {
-    row_mask: u32,
+    row_mask: GpioBits,
     last_row: Option<usize>,
-    bk: u32,
-    din: u32,
-    dck: u32,
+    bk: GpioBits,
+    din: GpioBits,
+    dck: GpioBits,
 }
 
 impl B707ShiftRegisterRowAddressSetter {
@@ -196,7 +196,7 @@ impl B707ShiftRegisterRowAddressSetter {
 }
 
 impl RowAddressSetter for B707ShiftRegisterRowAddressSetter {
-    fn used_bits(&self) -> u32 {
+    fn used_bits(&self) -> GpioBits {
         self.row_mask
     }
 
@@ -219,10 +219,10 @@ impl RowAddressSetter for B707ShiftRegisterRowAddressSetter {
 }
 
 pub(crate) struct ShiftRegisterRowAddressSetter {
-    row_mask: u32,
+    row_mask: GpioBits,
     last_row: Option<usize>,
-    clock: u32,
-    data: u32,
+    clock: GpioBits,
+    data: GpioBits,
     double_rows: usize,
 }
 
@@ -243,7 +243,7 @@ impl ShiftRegisterRowAddressSetter {
 }
 
 impl RowAddressSetter for ShiftRegisterRowAddressSetter {
-    fn used_bits(&self) -> u32 {
+    fn used_bits(&self) -> GpioBits {
         self.row_mask
     }
 
@@ -269,9 +269,9 @@ impl RowAddressSetter for ShiftRegisterRowAddressSetter {
 /// A shift register row address setter that does not use B but C for the data. Clock and data are inverted
 /// compared to [`ShiftRegisterRowAddressSetter`].
 pub(crate) struct ABCShiftRegisterRowAddressSetter {
-    row_mask: u32,
-    clock: u32,
-    data: u32,
+    row_mask: GpioBits,
+    clock: GpioBits,
+    data: GpioBits,
     double_rows: usize,
 }
 
@@ -291,7 +291,7 @@ impl ABCShiftRegisterRowAddressSetter {
 }
 
 impl RowAddressSetter for ABCShiftRegisterRowAddressSetter {
-    fn used_bits(&self) -> u32 {
+    fn used_bits(&self) -> GpioBits {
         self.row_mask
     }
 
@@ -323,8 +323,8 @@ impl RowAddressSetter for ABCShiftRegisterRowAddressSetter {
 /// Line C  | 1 | 1 | 0 | 1
 /// Line D  | 1 | 1 | 1 | 0
 pub(crate) struct DirectABCDLineRowAddressSetter {
-    row_lines: [u32; 4],
-    row_mask: u32,
+    row_lines: [GpioBits; 4],
+    row_mask: GpioBits,
     last_row: Option<usize>,
 }
 
@@ -345,7 +345,7 @@ impl DirectABCDLineRowAddressSetter {
 }
 
 impl RowAddressSetter for DirectABCDLineRowAddressSetter {
-    fn used_bits(&self) -> u32 {
+    fn used_bits(&self) -> GpioBits {
         self.row_mask
     }
 

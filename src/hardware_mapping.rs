@@ -4,14 +4,33 @@ use std::{error::Error, ops::BitOr, str::FromStr};
 
 use crate::gpio_bits;
 
+/// A set of GPIO pins, one bit per pin. With the `wide-gpio` feature, the pins above 31 of the compute module can be
+/// used as well.
+#[cfg(not(feature = "wide-gpio"))]
+pub(crate) type GpioBits = u32;
+#[cfg(feature = "wide-gpio")]
+pub(crate) type GpioBits = u64;
+
+/// The pins below 32, e.g. for the 32 bit GPIO registers.
+#[allow(clippy::unnecessary_cast)]
+pub(crate) const fn low_pins(bits: GpioBits) -> u32 {
+    bits as u32
+}
+
+/// The pins below 32 as [`GpioBits`].
+#[allow(clippy::useless_conversion)]
+pub(crate) fn from_low_pins(bits: u32) -> GpioBits {
+    GpioBits::from(bits)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ColorBits {
-    pub(crate) r1: u32,
-    pub(crate) g1: u32,
-    pub(crate) b1: u32,
-    pub(crate) r2: u32,
-    pub(crate) g2: u32,
-    pub(crate) b2: u32,
+    pub(crate) r1: GpioBits,
+    pub(crate) g1: GpioBits,
+    pub(crate) b1: GpioBits,
+    pub(crate) r2: GpioBits,
+    pub(crate) g2: GpioBits,
+    pub(crate) b2: GpioBits,
 }
 
 impl ColorBits {
@@ -26,19 +45,19 @@ impl ColorBits {
         }
     }
 
-    pub(crate) fn used_bits(&self) -> u32 {
+    pub(crate) fn used_bits(&self) -> GpioBits {
         self.r1 | self.r2 | self.g1 | self.g2 | self.b1 | self.b2
     }
 
-    fn red_bits(&self) -> u32 {
+    fn red_bits(&self) -> GpioBits {
         self.r1 | self.r2
     }
 
-    fn green_bits(&self) -> u32 {
+    fn green_bits(&self) -> GpioBits {
         self.g1 | self.g2
     }
 
-    fn blue_bits(&self) -> u32 {
+    fn blue_bits(&self) -> GpioBits {
         self.b1 | self.b2
     }
 }
@@ -49,25 +68,25 @@ pub(crate) struct Panels {
 }
 
 impl Panels {
-    pub(crate) fn used_bits(&self) -> u32 {
+    pub(crate) fn used_bits(&self) -> GpioBits {
         self.red_bits() | self.green_bits() | self.blue_bits()
     }
 
-    pub(crate) fn red_bits(&self) -> u32 {
+    pub(crate) fn red_bits(&self) -> GpioBits {
         self.color_bits
             .iter()
             .map(ColorBits::red_bits)
             .fold(0, BitOr::bitor)
     }
 
-    pub(crate) fn green_bits(&self) -> u32 {
+    pub(crate) fn green_bits(&self) -> GpioBits {
         self.color_bits
             .iter()
             .map(ColorBits::green_bits)
             .fold(0, BitOr::bitor)
     }
 
-    pub(crate) fn blue_bits(&self) -> u32 {
+    pub(crate) fn blue_bits(&self) -> GpioBits {
         self.color_bits
             .iter()
             .map(ColorBits::blue_bits)
@@ -77,15 +96,15 @@ impl Panels {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HardwareMapping {
-    pub(crate) output_enable: u32,
-    pub(crate) clock: u32,
-    pub(crate) strobe: u32,
+    pub(crate) output_enable: GpioBits,
+    pub(crate) clock: GpioBits,
+    pub(crate) strobe: GpioBits,
 
-    pub(crate) a: u32,
-    pub(crate) b: u32,
-    pub(crate) c: u32,
-    pub(crate) d: u32,
-    pub(crate) e: u32,
+    pub(crate) a: GpioBits,
+    pub(crate) b: GpioBits,
+    pub(crate) c: GpioBits,
+    pub(crate) d: GpioBits,
+    pub(crate) e: GpioBits,
 
     pub(crate) panels: Panels,
 }
@@ -123,12 +142,12 @@ impl FromStr for HardwareMapping {
 
 impl HardwareMapping {
     /// All bits used for output when driving `parallel` chains, except for the row address.
-    pub(crate) fn used_bits(&self, parallel: usize) -> u32 {
+    pub(crate) fn used_bits(&self, parallel: usize) -> GpioBits {
         self.output_enable | self.strobe | self.get_color_clock_mask(parallel)
     }
 
     /// Mask of bits while clocking in.
-    pub(crate) fn get_color_clock_mask(&self, parallel: usize) -> u32 {
+    pub(crate) fn get_color_clock_mask(&self, parallel: usize) -> GpioBits {
         self.panels
             .color_bits
             .iter()
@@ -366,10 +385,11 @@ impl HardwareMapping {
         }
     }
 
-    /// Pin-out for the official Compute Module I/O development board.
+    /// Pin-out for the official Compute Module I/O development board. No pin is left free when using 6 parallel
+    /// chains.
     ///
-    /// Upstream supports six parallel chains on this board, but chains 3 to 5 use GPIO pins above 31, which this
-    /// library can't drive. So up to three parallel chains are supported.
+    /// Chains 3 to 5 use the GPIO pins above 31, which needs the `wide-gpio` feature. Without it, up to three
+    /// parallel chains are supported.
     #[must_use]
     pub const fn compute_module() -> Self {
         Self {
@@ -409,13 +429,44 @@ impl HardwareMapping {
                         g2: gpio_bits!(26),
                         b2: gpio_bits!(27),
                     },
-                    ColorBits::unused(),
-                    ColorBits::unused(),
-                    ColorBits::unused(),
+                    Self::COMPUTE_MODULE_WIDE_CHAINS[0],
+                    Self::COMPUTE_MODULE_WIDE_CHAINS[1],
+                    Self::COMPUTE_MODULE_WIDE_CHAINS[2],
                 ],
             },
         }
     }
+
+    /// Chains 3 to 5 of the compute module, on the pins above 31.
+    #[cfg(feature = "wide-gpio")]
+    const COMPUTE_MODULE_WIDE_CHAINS: [ColorBits; 3] = [
+        ColorBits {
+            r1: gpio_bits!(28),
+            g1: gpio_bits!(29),
+            b1: gpio_bits!(30),
+            r2: gpio_bits!(31),
+            g2: gpio_bits!(32),
+            b2: gpio_bits!(33),
+        },
+        ColorBits {
+            r1: gpio_bits!(34),
+            g1: gpio_bits!(35),
+            b1: gpio_bits!(36),
+            r2: gpio_bits!(37),
+            g2: gpio_bits!(38),
+            b2: gpio_bits!(39),
+        },
+        ColorBits {
+            r1: gpio_bits!(40),
+            g1: gpio_bits!(41),
+            b1: gpio_bits!(42),
+            r2: gpio_bits!(43),
+            g2: gpio_bits!(44),
+            b2: gpio_bits!(45),
+        },
+    ];
+    #[cfg(not(feature = "wide-gpio"))]
+    const COMPUTE_MODULE_WIDE_CHAINS: [ColorBits; 3] = [ColorBits::unused(); 3];
 }
 
 #[cfg(test)]
@@ -430,6 +481,12 @@ mod tests {
         let i2c_uart = gpio_bits!(2, 3, 14);
         assert_eq!(regular.used_bits(1) & i2c_uart, 0);
         assert_eq!(regular.used_bits(3) & i2c_uart, i2c_uart);
+    }
+
+    #[test]
+    fn compute_module_has_six_chains_with_wide_gpio() {
+        let chains = HardwareMapping::compute_module().max_parallel_chains();
+        assert_eq!(chains, if cfg!(feature = "wide-gpio") { 6 } else { 3 });
     }
 
     #[test]

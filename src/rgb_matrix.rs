@@ -2,6 +2,7 @@ use std::{
     error::Error,
     fmt::{Display, Formatter},
     fs::{OpenOptions, write},
+    io::Write,
     mem::replace,
     sync::Arc,
     sync::atomic::{AtomicU32, Ordering},
@@ -9,21 +10,24 @@ use std::{
         Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError, channel,
         sync_channel,
     },
-    thread::{JoinHandle, spawn},
-    time::Duration,
+    thread::{JoinHandle, sleep, spawn},
+    time::{Duration, Instant},
 };
 use thread_priority::{ThreadPriority, set_current_thread_priority};
 
 use crate::{
     RGBMatrixConfig,
+    backend::Backend,
     canvas::{Canvas, PixelDesignator, PixelDesignatorMap},
     chip::PiChip,
     config::K_BIT_PLANES,
-    gpio::{Gpio, GpioInitializationError},
+    gpio::GpioInitializationError,
     named_pixel_mapper::MappingDirection,
     pixel_mapper::PixelMapper,
+    registers::{STORE_BARRIER_SUPPORTED, UserGpioOutputs},
     row_address_setter::RowAddressSetterType,
-    utils::{FrameRateMonitor, linux_has_isol_cpu, set_thread_affinity},
+    rp1::is_pi5_model,
+    utils::{FrameRateMonitor, linux_has_isol_cpu, set_thread_affinity, sleep_at_most},
 };
 
 /// How many input changes are kept until they are received.
@@ -121,19 +125,30 @@ impl Display for MatrixCreationError {
     }
 }
 
+/// Requests from the user to the display update thread.
+enum Control {
+    Shutdown,
+    /// Turns the pins into outputs and replies with the ones that were available.
+    RequestOutputs(u32, Sender<u32>),
+}
+
 pub struct RGBMatrix {
     /// The join handle of the update thread.
     thread_handle: Option<JoinHandle<()>>,
-    /// Sender for the shutdown signal.
-    shutdown_sender: Sender<()>,
+    /// Requests to the update thread.
+    control_sender: Sender<Control>,
     /// Receiver for GPIO inputs.
     input_receiver: Receiver<u32>,
-    /// Channel to send canvas to update thread.
-    canvas_to_thread_sender: SyncSender<Box<Canvas>>,
+    /// Channel to send canvas to update thread, with the number of frames to show the previous canvas for.
+    canvas_to_thread_sender: SyncSender<(Box<Canvas>, u32)>,
     /// Channel to receive canvas from update thread.
     canvas_from_thread_receiver: Receiver<Box<Canvas>>,
     /// Additional requested inputs that can be received.
     enabled_input_bits: u32,
+    /// The registers to write the outputs of the user. Not available on the Raspberry Pi 5.
+    user_outputs: Option<UserGpioOutputs>,
+    /// The pins that the user can write to.
+    enabled_output_bits: u32,
     /// Frame rate measurement.
     framerate: Arc<AtomicU32>,
 }
@@ -145,7 +160,7 @@ impl RGBMatrix {
     /// You can additionally request user readable GPIO bits which can later be received with
     /// [`RGBMatrix::receive_new_inputs`]. Only bits that are not already in use for reading or writing by the
     /// matrix are allowed. Use [`RGBMatrix::enabled_input_bits`] after calling this function to check which
-    /// bits were actually available.
+    /// bits were actually available. GPIO inputs are not supported on the Raspberry Pi 5.
     ///
     /// Note: If privilege dropping is enabled in the config, then calling this function will have the side
     /// effect of dropping the application's privileges down to the configured user/group.
@@ -153,18 +168,21 @@ impl RGBMatrix {
         mut config: RGBMatrixConfig,
         requested_inputs: u32,
     ) -> Result<(Self, Box<Canvas>), MatrixCreationError> {
-        // Check if we can access the memory before doing anything else.
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/mem")
-            .map_err(|_| MatrixCreationError::MemoryAccessError)?;
-
         let chip = if let Some(chip) = config.pi_chip {
             chip
         } else {
             PiChip::determine().ok_or(MatrixCreationError::ChipDeterminationError)?
         };
+        let uses_rp1 = chip.uses_rp1() || is_pi5_model();
+
+        // Check if we can access the memory before doing anything else. The Raspberry Pi 5 doesn't need it.
+        if !uses_rp1 {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/mem")
+                .map_err(|_| MatrixCreationError::MemoryAccessError)?;
+        }
 
         let max_parallel = config.hardware_mapping.max_parallel_chains();
         if config.parallel > max_parallel {
@@ -186,10 +204,14 @@ impl RGBMatrix {
         let canvas = Box::new(Canvas::new(&config, Arc::new(shared_mapper)));
         let mut thread_canvas = canvas.clone();
 
-        let (canvas_to_thread_sender, canvas_to_thread_receiver) = sync_channel::<Box<Canvas>>(0);
+        // The update thread drops the privileges, so map the registers for the user's outputs before.
+        let user_outputs = (!uses_rp1).then(|| UserGpioOutputs::new(chip));
+
+        let (canvas_to_thread_sender, canvas_to_thread_receiver) =
+            sync_channel::<(Box<Canvas>, u32)>(0);
         let (canvas_from_thread_sender, canvas_from_thread_receiver) =
             sync_channel::<Box<Canvas>>(1);
-        let (shutdown_sender, shutdown_receiver) = channel::<()>();
+        let (control_sender, control_receiver) = channel::<Control>();
         let (input_sender, input_receiver) = sync_channel::<u32>(INPUT_QUEUE_LENGTH);
         let (thread_start_result_sender, thread_start_result_receiver) =
             channel::<Result<u32, MatrixCreationError>>();
@@ -199,22 +221,21 @@ impl RGBMatrix {
         let thread_handle = spawn(move || {
             initialize_update_thread(chip);
 
-            let mut address_setter = config.row_setter.create(&config);
-
-            let mut gpio = match Gpio::new(chip, &config, address_setter.as_ref()) {
-                Ok(gpio) => gpio,
+            let mut backend = match Backend::new(chip, &config) {
+                Ok(backend) => backend,
                 Err(error) => {
                     // If sending fails, the main thread has already given up waiting.
-                    thread_start_result_sender
-                        .send(Err(MatrixCreationError::GpioError(error)))
-                        .ok();
+                    thread_start_result_sender.send(Err(error)).ok();
                     return;
                 }
             };
 
             // Run the initialization sequence if necessary.
-            if let Some(panel_type) = config.panel_type {
-                panel_type.run_init_sequence(&mut gpio, &config);
+            if let Some(panel_type) = config.panel_type
+                && let Err(error) = backend.init_panels(&panel_type.init(&config))
+            {
+                thread_start_result_sender.send(Err(error)).ok();
+                return;
             }
 
             let mut last_gpio_inputs: u32 = 0;
@@ -222,13 +243,15 @@ impl RGBMatrix {
             // Dither sequence
             let mut dither_low_bit_sequence = 0;
 
-            let frame_time_target_us = (1_000_000.0 / config.refresh_rate as f64) as u64;
+            let frame_time_target = Duration::from_secs(1) / config.refresh_rate as u32;
 
-            let color_clk_mask = config
-                .hardware_mapping
-                .get_color_clock_mask(config.parallel);
+            // The canvas to show next, and for how many frames to show the current one before.
+            let mut next_canvas: Option<Box<Canvas>> = None;
+            let mut frame_multiple = 1;
+            let mut frame_count: u32 = 0;
+            let mut refresh_display = config.show_refresh.then(RefreshRateDisplay::new);
 
-            let enabled_input_bits = gpio.request_enabled_inputs(requested_inputs);
+            let enabled_input_bits = backend.request_inputs(requested_inputs);
             if thread_start_result_sender
                 .send(Ok(enabled_input_bits))
                 .is_err()
@@ -238,13 +261,18 @@ impl RGBMatrix {
             }
 
             'thread: loop {
-                let start_time = gpio.get_time();
-                // Try to receive a shutdown request.
-                if shutdown_receiver.try_recv() != Err(TryRecvError::Empty) {
-                    break 'thread;
+                let start_time = Instant::now();
+                loop {
+                    match control_receiver.try_recv() {
+                        Ok(Control::RequestOutputs(bits, reply)) => {
+                            reply.send(backend.request_outputs(bits)).ok();
+                        }
+                        Ok(Control::Shutdown) | Err(TryRecvError::Disconnected) => break 'thread,
+                        Err(TryRecvError::Empty) => break,
+                    }
                 }
                 // Read input bits and send them if they have changed.
-                let new_inputs = gpio.read();
+                let new_inputs = backend.read_inputs();
                 if new_inputs != last_gpio_inputs {
                     match input_sender.try_send(new_inputs) {
                         Ok(()) => last_gpio_inputs = new_inputs,
@@ -254,47 +282,57 @@ impl RGBMatrix {
                     }
                 }
                 // Check for a swap canvas.
-                match canvas_to_thread_receiver.try_recv() {
-                    Ok(new_canvas) => {
+                if next_canvas.is_none() {
+                    match canvas_to_thread_receiver.try_recv() {
+                        Ok((new_canvas, multiple)) => {
+                            next_canvas = Some(new_canvas);
+                            frame_multiple = multiple.max(1);
+                        }
+                        Err(TryRecvError::Disconnected) => {
+                            break 'thread;
+                        }
+                        Err(TryRecvError::Empty) => {}
+                    }
+                }
+                // Only swap after the requested number of frames.
+                if frame_count.is_multiple_of(frame_multiple) {
+                    frame_count = 0;
+                    if let Some(new_canvas) = next_canvas.take() {
                         let old_canvas = replace(&mut thread_canvas, new_canvas);
                         let Ok(()) = canvas_from_thread_sender.send(old_canvas) else {
                             break 'thread;
                         };
                     }
-                    Err(TryRecvError::Disconnected) => {
-                        break 'thread;
-                    }
-                    Err(TryRecvError::Empty) => {}
                 }
 
-                thread_canvas.dump_to_matrix(
-                    &mut gpio,
-                    &config.hardware_mapping,
-                    address_setter.as_mut(),
+                backend.dump(
+                    &thread_canvas,
                     dither_start_bits[dither_low_bit_sequence % dither_start_bits.len()],
-                    color_clk_mask,
                 );
                 dither_low_bit_sequence += 1;
+                frame_count += 1;
 
                 frame_rate_monitor.update();
 
-                // Sleep for the rest of the frame.
-                let now_time = gpio.get_time();
-                let end_time = start_time + frame_time_target_us;
-                if let Some(remaining_time) = end_time.checked_sub(now_time) {
-                    gpio.sleep(remaining_time);
+                // Wait for the rest of the frame.
+                let end_time = start_time + frame_time_target;
+                if config.busy_waiting {
+                    sleep_at_most(end_time.saturating_duration_since(Instant::now()));
+                    while Instant::now() < end_time {
+                        std::hint::spin_loop();
+                    }
+                } else {
+                    sleep(end_time.saturating_duration_since(Instant::now()));
+                }
+
+                if let Some(display) = refresh_display.as_mut() {
+                    display.update(start_time.elapsed());
                 }
             }
 
             // Turn it off.
             thread_canvas.fill(0, 0, 0);
-            thread_canvas.dump_to_matrix(
-                &mut gpio,
-                &config.hardware_mapping,
-                address_setter.as_mut(),
-                0,
-                color_clk_mask,
-            );
+            backend.dump(&thread_canvas, 0);
         });
 
         let enabled_input_bits =
@@ -317,11 +355,13 @@ impl RGBMatrix {
 
         let rgbmatrix = Self {
             thread_handle: Some(thread_handle),
+            control_sender,
             input_receiver,
-            shutdown_sender,
             canvas_to_thread_sender,
             canvas_from_thread_receiver,
             enabled_input_bits,
+            user_outputs,
+            enabled_output_bits: 0,
             framerate,
         };
 
@@ -389,6 +429,16 @@ impl RGBMatrix {
         }
         if config.refresh_rate == 0 {
             return invalid("refresh_rate must be at least 1.".to_string());
+        }
+        if let Some(slowdown) = config.slowdown {
+            if !(-1..=60).contains(&slowdown) {
+                return invalid(format!(
+                    "slowdown must be between -1 and 60, got {slowdown}."
+                ));
+            }
+            if slowdown == -1 && !STORE_BARRIER_SUPPORTED {
+                return invalid("slowdown -1 needs an ARMv7 or newer processor.".to_string());
+            }
         }
         // The B707 shift register advances by one row with every address, so the rows have to be in order.
         if config.interlaced && config.row_setter == RowAddressSetterType::B707ShiftRegister {
@@ -472,8 +522,15 @@ impl RGBMatrix {
     /// If this function is not called before the next frame update, the previous
     /// frame is drawn again.
     ///
-    /// The returned canvas has the same brightness and PWM bits as the one passed in.
+    /// The returned canvas has the same brightness, PWM bits and luminance correction as the one passed in.
     pub fn update_on_vsync(&mut self, canvas: Box<Canvas>) -> Box<Canvas> {
+        self.update_on_vsync_every(canvas, 1)
+    }
+
+    /// Like [`RGBMatrix::update_on_vsync`], but the current canvas is shown for a multiple of `frames` frames
+    /// before the new one. This gives a stable frame rate that is a fraction of the refresh rate, e.g. for
+    /// animations.
+    pub fn update_on_vsync_every(&mut self, canvas: Box<Canvas>, frames: u32) -> Box<Canvas> {
         let Self {
             canvas_to_thread_sender,
             canvas_from_thread_receiver,
@@ -482,9 +539,10 @@ impl RGBMatrix {
 
         let brightness = canvas.brightness();
         let pwm_bits = canvas.pwm_bits();
+        let luminance_correct = canvas.luminance_correct();
 
         canvas_to_thread_sender
-            .send(canvas)
+            .send((canvas, frames))
             .expect("Display update thread shut down unexpectedly.");
 
         let mut canvas = canvas_from_thread_receiver
@@ -494,6 +552,7 @@ impl RGBMatrix {
         // Both canvases need the same settings, otherwise they would alternate between frames.
         canvas.set_brightness(brightness);
         canvas.set_pwm_bits(pwm_bits);
+        canvas.set_luminance_correct(luminance_correct);
 
         // Clear the canvas before handing it back to the user.
         // There is no practical use for not clearing it here as we switch
@@ -513,6 +572,33 @@ impl RGBMatrix {
         self.input_receiver.recv_timeout(timeout).ok()
     }
 
+    /// Turns GPIO pins that are not used by the matrix into outputs, which can be set with
+    /// [`RGBMatrix::output_gpio`]. Returns the pins that were available. GPIO outputs are not supported on the
+    /// Raspberry Pi 5.
+    pub fn request_outputs(&mut self, bits: u32) -> u32 {
+        if self.user_outputs.is_none() {
+            return 0;
+        }
+        let (reply_sender, reply_receiver) = channel();
+        if self
+            .control_sender
+            .send(Control::RequestOutputs(bits, reply_sender))
+            .is_err()
+        {
+            return 0;
+        }
+        let enabled = reply_receiver.recv().unwrap_or(0);
+        self.enabled_output_bits |= enabled;
+        enabled
+    }
+
+    /// Sets the outputs from [`RGBMatrix::request_outputs`] to the given values. Other bits are ignored.
+    pub fn output_gpio(&self, values: u32) {
+        if let Some(outputs) = &self.user_outputs {
+            outputs.write_masked_bits(values, self.enabled_output_bits);
+        }
+    }
+
     /// Get the average frame rate over the last 60 frames.
     #[must_use]
     pub fn get_framerate(&self) -> usize {
@@ -524,13 +610,45 @@ impl Drop for RGBMatrix {
     fn drop(&mut self) {
         let Self {
             thread_handle,
-            shutdown_sender,
+            control_sender,
             ..
         } = self;
         if let Some(handle) = thread_handle.take() {
-            shutdown_sender.send(()).ok();
+            control_sender.send(Control::Shutdown).ok();
             let _result = handle.join();
         }
+    }
+}
+
+/// Prints the refresh rate of each frame, and the lowest one after the start up.
+struct RefreshRateDisplay {
+    start: Instant,
+    longest_frame: Duration,
+}
+
+impl RefreshRateDisplay {
+    /// Times are janky at the start, so the lowest refresh rate is only measured after this.
+    const HOLDOFF: Duration = Duration::from_secs(2);
+
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            longest_frame: Duration::ZERO,
+        }
+    }
+
+    fn update(&mut self, frame_time: Duration) {
+        let mut stdout = std::io::stdout().lock();
+        let hz = 1.0 / frame_time.as_secs_f64();
+        let _ = write!(stdout, "\r{hz:6.1}Hz");
+        if self.start.elapsed() > Self::HOLDOFF && frame_time > self.longest_frame {
+            self.longest_frame = frame_time;
+        }
+        if !self.longest_frame.is_zero() {
+            let lowest = 1.0 / self.longest_frame.as_secs_f64();
+            let _ = write!(stdout, " (lowest: {lowest:.1}Hz)");
+        }
+        let _ = stdout.flush();
     }
 }
 
