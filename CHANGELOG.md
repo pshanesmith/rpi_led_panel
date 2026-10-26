@@ -1,5 +1,53 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+Ported from the upstream C++ library:
+
+- Multiplexers `P10Outdoor32x16QuarterScan`, `P3Outdoor64x64`, `DoubleZ`, `P4Outdoor80x40`, `ZStripe44For40x20` and `P10Outdoor1R1G1B2For40x20`.
+- Pixel mappers `V-mapper`, `StackToRow` and `Remap`.
+- The `ComputeModule` hardware mapping, limited to three parallel chains because the others use GPIO pins above 31.
+- The `B707ShiftRegister` row address setter.
+
+### Fixed
+
+- Fix a panic when a pixel mapper makes the canvas taller than six panels, e.g. `Rotate:90` on a long chain or a 1:4 multiplexer with parallel chains.
+- Support the `AdafruitHat`, `Classic` and `ClassicPi1` hardware mappings, which panicked because their output enable pin can't be driven by the PWM hardware. They now use timer based pulses.
+- Only claim the GPIO pins of the parallel chains in use. Previously, e.g. the I2C and UART pins were always turned into outputs.
+- `Canvas::set_brightness` and `Canvas::set_pwm_bits` now carry over to the canvas returned by `RGBMatrix::update_on_vsync` instead of only applying to every other frame.
+- Fix the 64 bit system timer read, which could jump by about 71 minutes when the low half overflowed.
+- Fix the `GBR` and `BRG` LED sequences, which were swapped compared to the upstream library.
+- Fix the vertical blocks of the `P8Outdoor1R1G1B` multiplexer.
+- Fix the `ABCShiftRegister` row address setter to match the upstream library.
+- Fix the `RegularPi1` hardware mapping, which used the wrong pins for red and green.
+- Send the FM6126 and FM6127 init registers most significant bit first and to all panels of the chain.
+- Fix interlaced scanning with an odd number of rows.
+- Allow negative angles for `Rotate` and reject angles that aren't multiples of 90 when creating the matrix.
+- Report invalid configurations (`pwm_bits`, `rows`, `cols`, `chain_length`, `parallel`, `refresh_rate`, `pwm_lsb_nanoseconds`) as errors instead of panicking, and report panics of the update thread during initialization with their message.
+- Fix the canvas size, centering and redundant clearing in the examples.
+- Fix the `P10Outdoor32x16QuarterScan` multiplexer, which made the canvas twice as tall as the panel and drew a
+  second parallel chain onto the lower data lines of the first one. Upstream has the same bug.
+- Fix the canvas width of the `U-mapper` for panels whose width isn't a multiple of 32, e.g. 40x20 or 80x40 panels.
+- Reject interlacing with the `B707ShiftRegister` row setter, which needs the rows in order.
+- `Canvas::fill` no longer lights up LEDs that aren't part of the canvas, e.g. panels left out with `Remap`.
+- Determine the Raspberry Pi model from the device tree if /proc/cpuinfo has no revision, instead of misreading the
+  CPU core revision.
+- Report pixel mappers that produce an empty canvas as an error.
+- Limit the queue of GPIO input changes so that it can't grow forever when nobody receives them.
+- Return an error instead of panicking when the user or group name to drop privileges to contains a NUL byte.
+
+### Changed
+
+- Share the pixel map and color lookup table between canvases and shrink the pixel map entries.
+- Leave a margin for the OS sleep jitter and busy-wait the rest, to avoid overshooting.
+
+### Breaking
+
+- New `MatrixCreationError` variants `ThreadPanicked` and `InvalidConfig`.
+- `NamedPixelMapperType` is no longer `Copy`, because `Remap` holds a list of panels.
+
 ## Version 0.9.1
 
 ### Fixed 

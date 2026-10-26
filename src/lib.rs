@@ -21,7 +21,7 @@ pub use config::RGBMatrixConfig;
 pub use hardware_mapping::HardwareMapping;
 pub use init_sequence::PanelType;
 pub use multiplex_mapper::MultiplexMapperType;
-pub use named_pixel_mapper::NamedPixelMapperType;
+pub use named_pixel_mapper::{NamedPixelMapperType, RemapLayout};
 pub use rgb_matrix::RGBMatrix;
 pub use row_address_setter::RowAddressSetterType;
 

@@ -6,12 +6,42 @@ use crate::{
 
 const PWM_BASE_TIME_NS: u32 = 2;
 
+/// Output enable pins that can be driven by the PWM hardware.
+pub(crate) const HARDWARE_PULSE_PINS: [u32; 2] = [gpio_bits!(18), gpio_bits!(12)];
+
+/// Generates the output enable pulses that light up the LEDs for the duration of a bit plane.
+pub(crate) enum PinPulser {
+    /// Uses the PWM peripheral for exact timing. Requires output enable on GPIO 18 or 12.
+    Hardware(HardwarePinPulser),
+    /// Toggles the output enable pins directly for wirings that are not connected to the PWM peripheral.
+    Timer(TimerPinPulser),
+}
+
+pub(crate) struct TimerPinPulser {
+    pins: u32,
+    bitplane_timings_ns: Vec<u32>,
+}
+
+impl TimerPinPulser {
+    pub(crate) fn new(pins: u32, bitplane_timings_ns: &[u32]) -> Self {
+        Self {
+            pins,
+            bitplane_timings_ns: bitplane_timings_ns.to_vec(),
+        }
+    }
+
+    /// The (active low) output enable pins and how long they need to be enabled for the bit plane.
+    pub(crate) fn pulse(&self, bitplane: usize) -> (u32, u32) {
+        (self.pins, self.bitplane_timings_ns[bitplane])
+    }
+}
+
 struct Pulse {
     start_time: u64,
     sleep_hint_us: u32,
 }
 
-pub(crate) struct PinPulser {
+pub(crate) struct HardwarePinPulser {
     /// Hints how long to sleep.
     sleep_hints_us: Vec<u32>,
     /// Pulse period for each bit plane.
@@ -20,7 +50,7 @@ pub(crate) struct PinPulser {
     current_pulse: Option<Pulse>,
 }
 
-impl PinPulser {
+impl HardwarePinPulser {
     pub(crate) fn new(
         pins: u32,
         bitplane_timings_ns: &[u32],
@@ -39,7 +69,7 @@ impl PinPulser {
             // Set GPIO 12 to PWM0 mode
             gpio_registers.select_function(12, GPIOFunction::Alt0);
         } else {
-            unreachable!()
+            unreachable!("Only GPIO 18 and 12 support hardware pulses.")
         }
 
         pwm_registers.reset_pwm();
@@ -102,7 +132,7 @@ impl PinPulser {
             return;
         };
 
-        let already_elapsed_us = time_registers.get_time() - pulse.start_time;
+        let already_elapsed_us = time_registers.get_time().saturating_sub(pulse.start_time);
         let remaining_time_us = u64::from(pulse.sleep_hint_us).saturating_sub(already_elapsed_us);
         sleep_at_most(std::time::Duration::from_micros(remaining_time_us));
 

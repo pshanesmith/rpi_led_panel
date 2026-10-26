@@ -155,36 +155,34 @@ impl GPIORegisters {
 const ST_OFFSET: u64 = 0x3000;
 const ST_SIZE_BYTES: usize = 28;
 const ST_CLO: usize = 0x4;
-
-/// Required to read `ST_CLO` and the adjacent `ST_CHI`.
-/// This has to be a struct so that we can have a fixed memory layout.
-#[repr(C)]
-struct TimeRegister {
-    low: u32,
-    high: u32,
-}
-
-impl TimeRegister {
-    fn get_u64(&self) -> u64 {
-        (u64::from(self.high) << u32::BITS) | u64::from(self.low)
-    }
-}
+const ST_CHI: usize = 0x8;
 
 // Time measurement.
 pub(crate) struct TimeRegisters {
-    time: MmapPtr<TimeRegister>,
+    low: MmapPtr<u32>,
+    high: MmapPtr<u32>,
 }
 
 impl TimeRegisters {
     pub(crate) fn new(chip: PiChip) -> Self {
         let map = mmap_bcm_register(chip, ST_OFFSET, ST_SIZE_BYTES);
-        let time = MmapPtr::new(map, ST_CLO);
-        Self { time }
+        let low = MmapPtr::new(map.clone(), ST_CLO);
+        let high = MmapPtr::new(map, ST_CHI);
+        Self { low, high }
     }
 
+    /// Time in microseconds from the free running 64 bit system timer.
     #[inline]
     pub(crate) fn get_time(&self) -> u64 {
-        self.time.read().get_u64()
+        // The two halves can't be read at once. If the low half overflowed in between the reads, the high half
+        // changes and we read again.
+        loop {
+            let high = self.high.read();
+            let low = self.low.read();
+            if self.high.read() == high {
+                return (u64::from(high) << u32::BITS) | u64::from(low);
+            }
+        }
     }
 
     pub(crate) fn sleep(&mut self, duration_us: u64) {

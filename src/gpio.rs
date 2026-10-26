@@ -8,10 +8,10 @@ use crate::{
     chip::PiChip,
     config::K_BIT_PLANES,
     gpio_bits,
-    pin_pulser::PinPulser,
+    pin_pulser::{HARDWARE_PULSE_PINS, HardwarePinPulser, PinPulser, TimerPinPulser},
     registers::{ClkRegisters, GPIOFunction, GPIORegisters, PWMRegisters, TimeRegisters},
     row_address_setter::RowAddressSetter,
-    utils::{drop_privs, linux_has_module_loaded},
+    utils::{drop_privs, linux_has_module_loaded, sleep_nanos},
 };
 
 #[derive(Debug)]
@@ -83,7 +83,7 @@ impl Gpio {
 
         // Tell GPIO about all bits we intend to use.
         let mut all_used_bits: u32 = 0;
-        all_used_bits |= config.hardware_mapping.used_bits();
+        all_used_bits |= config.hardware_mapping.used_bits(config.parallel);
         all_used_bits |= address_setter.used_bits();
 
         let input_bits = 0;
@@ -134,13 +134,20 @@ impl Gpio {
             };
         });
 
-        let pin_pulser = PinPulser::new(
-            config.hardware_mapping.output_enable,
-            &bitplane_timings,
-            &mut pwm_registers,
-            &mut gpio_registers,
-            &mut clk_registers,
-        );
+        let output_enable = config.hardware_mapping.output_enable;
+        let pin_pulser = if HARDWARE_PULSE_PINS.contains(&output_enable) {
+            PinPulser::Hardware(HardwarePinPulser::new(
+                output_enable,
+                &bitplane_timings,
+                &mut pwm_registers,
+                &mut gpio_registers,
+                &mut clk_registers,
+            ))
+        } else {
+            // Output enable is active low, so keep the LEDs off until the first pulse.
+            gpio_registers.write_set_bits(output_enable);
+            PinPulser::Timer(TimerPinPulser::new(output_enable, &bitplane_timings))
+        };
 
         let gpio_slowdown = config.slowdown.unwrap_or_else(|| chip.gpio_slowdown());
 
@@ -186,7 +193,17 @@ impl Gpio {
             pin_pulser,
             ..
         } = self;
-        pin_pulser.send_pulse(bitplane, pwm_registers, time_registers);
+        match pin_pulser {
+            PinPulser::Hardware(pulser) => {
+                pulser.send_pulse(bitplane, pwm_registers, time_registers);
+            }
+            PinPulser::Timer(pulser) => {
+                let (pins, duration_ns) = pulser.pulse(bitplane);
+                self.clear_bits(pins);
+                sleep_nanos(duration_ns);
+                self.set_bits(pins);
+            }
+        }
     }
 
     pub(crate) fn wait_pulse_finished(&mut self) {
@@ -196,7 +213,10 @@ impl Gpio {
             pin_pulser,
             ..
         } = self;
-        pin_pulser.wait_pulse_finished(time_registers, pwm_registers);
+        // The timer based pulses are already finished when `send_pulse` returns.
+        if let PinPulser::Hardware(pulser) = pin_pulser {
+            pulser.wait_pulse_finished(time_registers, pwm_registers);
+        }
     }
 
     pub(crate) fn request_enabled_inputs(&mut self, mut enabled_bits: u32) -> u32 {

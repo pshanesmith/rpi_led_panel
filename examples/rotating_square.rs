@@ -19,15 +19,16 @@ fn rotate([x, y]: [f64; 2], angle: f64) -> [f64; 2] {
 
 fn main() {
     let config: RGBMatrixConfig = argh::from_env();
-    let rows = config.rows as isize;
-    let cols = config.cols as isize;
     let (mut matrix, mut canvas) = RGBMatrix::new(config, 0).expect("Matrix initialization failed");
+    // The canvas size includes chained panels and pixel mappers.
+    let rows = canvas.height() as isize;
+    let cols = canvas.width() as isize;
 
     let [center_x, center_y] = [cols / 2, rows / 2];
 
     let display_square = (rows.min(cols) as f64 * 0.7) as isize;
-    let min_display = center_x - display_square / 2;
-    let max_display = center_x + display_square / 2;
+    let [min_x, max_x] = [center_x - display_square / 2, center_x + display_square / 2];
+    let [min_y, max_y] = [center_y - display_square / 2, center_y + display_square / 2];
 
     for step in 0.. {
         let rotation_deg = step as f64 / 2.0;
@@ -39,18 +40,15 @@ fn main() {
                 );
                 let x = (src_x + center_x as f64).round() as isize;
                 let y = (src_y + center_y as f64).round() as isize;
-                if (min_display..max_display).contains(&x)
-                    && (min_display..max_display).contains(&y)
-                {
+                // The canvas returned by `update_on_vsync` is already cleared, so only draw the square.
+                if (min_x..max_x).contains(&x) && (min_y..max_y).contains(&y) {
                     canvas.set_pixel(
                         canvas_x as usize,
                         canvas_y as usize,
-                        scale_col(x, min_display, max_display),
-                        255 - scale_col(y, min_display, max_display),
-                        scale_col(y, min_display, max_display),
+                        scale_col(x, min_x, max_x),
+                        255 - scale_col(y, min_y, max_y),
+                        scale_col(y, min_y, max_y),
                     )
-                } else {
-                    canvas.set_pixel(canvas_x as usize, canvas_y as usize, 0, 0, 0)
                 }
             }
         }
