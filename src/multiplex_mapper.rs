@@ -74,12 +74,70 @@ pub(crate) struct MultiplexMapper {
 }
 
 impl MultiplexMapper {
-    pub(crate) fn edit_rows_cols(&mut self, rows: &mut usize, cols: &mut usize) {
+    /// Changes the visible panel size to the electrical one. Fails if the mapper can't handle the panel size.
+    pub(crate) fn edit_rows_cols(
+        &mut self,
+        rows: &mut usize,
+        cols: &mut usize,
+    ) -> Result<(), MatrixCreationError> {
+        self.validate_panel_size(*rows, *cols)?;
+        let new_cols = cols
+            .checked_mul(self.kind.stretch_factor())
+            .ok_or_else(|| {
+                MatrixCreationError::PixelMapperError(format!(
+                    "{:?}: {} columns are too many.",
+                    self.kind, *cols
+                ))
+            })?;
         self.panel_rows = *rows;
         self.panel_cols = *cols;
 
         *rows /= self.kind.row_divisor();
-        *cols *= self.kind.stretch_factor();
+        *cols = new_cols;
+        Ok(())
+    }
+
+    /// The panel layouts that are computed from the panel size need it to split into stripes and quarters.
+    fn validate_panel_size(&self, rows: usize, cols: usize) -> Result<(), MatrixCreationError> {
+        let kind = self.kind;
+        let error = |message: String| {
+            Err(MatrixCreationError::PixelMapperError(format!(
+                "{kind:?} does not support {cols}x{rows} panels: {message}"
+            )))
+        };
+        if rows == 0 || cols == 0 {
+            return error("the panel is empty.".to_string());
+        }
+        let row_divisor = kind.row_divisor();
+        if !rows.is_multiple_of(row_divisor) {
+            return error(format!("the rows need to be a multiple of {row_divisor}."));
+        }
+        use MultiplexMapperType as M;
+        // Stripes of a quarter of the rows.
+        let quarter_rows = matches!(
+            kind,
+            M::Stripe
+                | M::FlippedStripe
+                | M::Checkered
+                | M::Spiral
+                | M::Coreman
+                | M::P3Outdoor64x64
+                | M::DoubleZ
+        );
+        if quarter_rows && !rows.is_multiple_of(4) {
+            return error("the rows need to be a multiple of 4.".to_string());
+        }
+        let column_divisor = match kind {
+            M::Checkered | M::Coreman => 2,
+            M::Spiral | M::DoubleZ => 4,
+            _ => 1,
+        };
+        if !cols.is_multiple_of(column_divisor) {
+            return error(format!(
+                "the columns need to be a multiple of {column_divisor}."
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn get_size_mapping(
@@ -99,48 +157,54 @@ impl MultiplexMapper {
         _matrix_height: usize,
         visible_x: usize,
         visible_y: usize,
-    ) -> [usize; 2] {
+    ) -> Option<[usize; 2]> {
         let stretch_factor = self.kind.stretch_factor();
-        let chained_panel = visible_x / self.panel_cols;
-        let parallel_panel = visible_y / self.panel_rows;
+        let chained_panel = visible_x.checked_div(self.panel_cols)?;
+        let parallel_panel = visible_y.checked_div(self.panel_rows)?;
 
         let within_panel_x = visible_x % self.panel_cols;
         let within_panel_y = visible_y % self.panel_rows;
 
-        let [new_x, new_y] = self.map_single_panel(within_panel_x, within_panel_y);
-        let matrix_x = chained_panel * stretch_factor * self.panel_cols + new_x;
-        let matrix_y = parallel_panel * self.panel_rows / self.kind.row_divisor() + new_y;
-        [matrix_x, matrix_y]
+        let [new_x, new_y] = self.map_single_panel(within_panel_x, within_panel_y)?;
+        let matrix_x = (chained_panel * stretch_factor)
+            .checked_mul(self.panel_cols)?
+            .checked_add(new_x)?;
+        let matrix_y = (parallel_panel.checked_mul(self.panel_rows)? / self.kind.row_divisor())
+            .checked_add(new_y)?;
+        Some([matrix_x, matrix_y])
     }
 
-    fn map_single_panel(&self, x: usize, y: usize) -> [usize; 2] {
+    /// Where a pixel of a single panel is in the electrical layout, or `None` if the layout doesn't cover it.
+    fn map_single_panel(&self, x: usize, y: usize) -> Option<[usize; 2]> {
         let rows = self.panel_rows;
         let cols = self.panel_cols;
         match self.kind {
-            MultiplexMapperType::Stripe => stripe(rows, cols, x, y, false),
-            MultiplexMapperType::FlippedStripe => stripe(rows, cols, x, y, true),
-            MultiplexMapperType::Checkered => checkered(rows, cols, x, y),
+            MultiplexMapperType::Stripe => Some(stripe(rows, cols, x, y, false)),
+            MultiplexMapperType::FlippedStripe => Some(stripe(rows, cols, x, y, true)),
+            MultiplexMapperType::Checkered => Some(checkered(rows, cols, x, y)),
             MultiplexMapperType::Spiral => spiral(rows, cols, x, y),
-            MultiplexMapperType::ZStripe08 => z_stripe(x, y, 0, 8, 4),
-            MultiplexMapperType::ZStripe44 => z_stripe(x, y, 4, 4, 4),
-            MultiplexMapperType::ZStripe80 => z_stripe(x, y, 8, 0, 4),
-            MultiplexMapperType::ZStripe44For40x20 => z_stripe(x, y, 4, 4, 5),
-            MultiplexMapperType::Coreman => coreman(rows, cols, x, y),
+            MultiplexMapperType::ZStripe08 => Some(z_stripe(x, y, 0, 8, 4)),
+            MultiplexMapperType::ZStripe44 => Some(z_stripe(x, y, 4, 4, 4)),
+            MultiplexMapperType::ZStripe80 => Some(z_stripe(x, y, 8, 0, 4)),
+            MultiplexMapperType::ZStripe44For40x20 => Some(z_stripe(x, y, 4, 4, 5)),
+            MultiplexMapperType::Coreman => Some(coreman(rows, cols, x, y)),
             MultiplexMapperType::Kaler2Scan => kaler_2_scan(x, y),
             MultiplexMapperType::P10Z => p10_z(x, y),
-            MultiplexMapperType::QiangLiQ8 => qiang_li_q8(x, y),
-            MultiplexMapperType::InversedZStripe => inversed_z_stripe(x, y),
-            MultiplexMapperType::P10Outdoor1R1G1B1 => p10_outdoor_1r1g1b_1(x, y),
-            MultiplexMapperType::P10Outdoor1R1G1B2 => p10_outdoor_1r1g1b_2(x, y, P10_TILE_HEIGHT),
-            MultiplexMapperType::P10Outdoor1R1G1B2For40x20 => p10_outdoor_1r1g1b_2(x, y, 5),
-            MultiplexMapperType::P10Outdoor1R1G1B3 => p10_outdoor_1r1g1b_3(x, y),
-            MultiplexMapperType::P10Coreman => p10_coreman(x, y),
+            MultiplexMapperType::QiangLiQ8 => Some(qiang_li_q8(x, y)),
+            MultiplexMapperType::InversedZStripe => Some(inversed_z_stripe(x, y)),
+            MultiplexMapperType::P10Outdoor1R1G1B1 => Some(p10_outdoor_1r1g1b_1(x, y)),
+            MultiplexMapperType::P10Outdoor1R1G1B2 => {
+                Some(p10_outdoor_1r1g1b_2(x, y, P10_TILE_HEIGHT))
+            }
+            MultiplexMapperType::P10Outdoor1R1G1B2For40x20 => Some(p10_outdoor_1r1g1b_2(x, y, 5)),
+            MultiplexMapperType::P10Outdoor1R1G1B3 => Some(p10_outdoor_1r1g1b_3(x, y)),
+            MultiplexMapperType::P10Coreman => Some(p10_coreman(x, y)),
             MultiplexMapperType::P8Outdoor1R1G1B => p8_outdoor_1r1g1b(x, y),
-            MultiplexMapperType::P10Outdoor32x16HalfScan => p10_outdoor_32x16_half_scan(x, y),
+            MultiplexMapperType::P10Outdoor32x16HalfScan => Some(p10_outdoor_32x16_half_scan(x, y)),
             MultiplexMapperType::P10Outdoor32x16QuarterScan => p10_outdoor_32x16_quarter_scan(x, y),
-            MultiplexMapperType::P3Outdoor64x64 => p3_outdoor_64x64(rows, x, y),
+            MultiplexMapperType::P3Outdoor64x64 => Some(p3_outdoor_64x64(rows, x, y)),
             MultiplexMapperType::DoubleZ => double_z(rows, cols, x, y),
-            MultiplexMapperType::P4Outdoor80x40 => p4_outdoor_80x40(x, y),
+            MultiplexMapperType::P4Outdoor80x40 => Some(p4_outdoor_80x40(x, y)),
         }
     }
 }
@@ -173,18 +237,18 @@ fn checkered(rows: usize, cols: usize, x: usize, y: usize) -> [usize; 2] {
     [matrix_x, stripe_row(rows, y)]
 }
 
-fn spiral(rows: usize, cols: usize, x: usize, y: usize) -> [usize; 2] {
-    let is_top_stripe = (y % (rows / 2)) < rows / 4;
+fn spiral(rows: usize, cols: usize, x: usize, y: usize) -> Option<[usize; 2]> {
+    let is_top_stripe = y.checked_rem(rows / 2)? < rows / 4;
     let panel_quarter = cols / 4;
-    let quarter = x / panel_quarter;
+    let quarter = x.checked_div(panel_quarter)?;
     let offset = x % panel_quarter;
     let matrix_x = (2 * quarter * panel_quarter)
         + if is_top_stripe {
-            panel_quarter - 1 - offset
+            panel_quarter.checked_sub(1 + offset)?
         } else {
             panel_quarter + offset
         };
-    [matrix_x, stripe_row(rows, y)]
+    Some([matrix_x, stripe_row(rows, y)])
 }
 
 /// `tile_height` is 4 for the common 1:4 scan panels; 1:5 scan panels (e.g. 40x20 outdoor modules) use 5.
@@ -228,20 +292,25 @@ fn coreman(rows: usize, cols: usize, x: usize, y: usize) -> [usize; 2] {
     }
 }
 
-fn kaler_2_scan(x: usize, y: usize) -> [usize; 2] {
+fn kaler_2_scan(x: usize, y: usize) -> Option<[usize; 2]> {
     // Now we have a 128x4 matrix
     let offset: isize = if ((y % 4) / 2) == 0 { -1 } else { 1 }; // Add or subtract
     let delta_offset: isize = if offset < 0 { 7 } else { 8 };
     let delta_column: isize = if ((y % 8) / 4) == 0 { 64 } else { 0 };
 
     let matrix_y = y % 2 + (y / 8) * 2;
-    let matrix_x =
-        (delta_column + (16 * (x as isize / 8)) + delta_offset + ((x as isize % 8) * offset))
-            as usize;
-    [matrix_x, matrix_y]
+    let x = isize::try_from(x).ok()?;
+    let matrix_x = usize::try_from(
+        delta_column
+            .checked_add(16isize.checked_mul(x / 8)?)?
+            .checked_add(delta_offset + (x % 8) * offset)?,
+    )
+    .ok()?;
+    Some([matrix_x, matrix_y])
 }
 
-fn p10_z(x: usize, y: usize) -> [usize; 2] {
+/// Only covers the 16 rows of a P10 panel.
+fn p10_z(x: usize, y: usize) -> Option<[usize; 2]> {
     let y_comp = match y {
         0 | 1 | 8 | 9 => 127,
         2 | 3 | 10 | 11 => 112,
@@ -251,8 +320,10 @@ fn p10_z(x: usize, y: usize) -> [usize; 2] {
     };
 
     let matrix_x = match y {
-        0 | 1 | 4 | 5 | 8 | 9 | 12 | 13 => y_comp - x - 24 * (x / 8),
-        _ => y_comp + x - 40 * (x / 8),
+        0 | 1 | 4 | 5 | 8 | 9 | 12 | 13 => {
+            (y_comp as usize).checked_sub(x.checked_add(24 * (x / 8))?)?
+        }
+        _ => (y_comp as usize + x).checked_sub(40 * (x / 8))?,
     };
 
     let matrix_y = match y {
@@ -263,7 +334,7 @@ fn p10_z(x: usize, y: usize) -> [usize; 2] {
         _ => y,
     };
 
-    [matrix_x, matrix_y]
+    Some([matrix_x, matrix_y])
 }
 
 fn qiang_li_q8(x: usize, y: usize) -> [usize; 2] {
@@ -375,11 +446,11 @@ fn p10_outdoor_32x16_half_scan(x: usize, y: usize) -> [usize; 2] {
 }
 
 /// P10 quarter scan panel, e.g. <https://www.ebay.com.au/itm/175517677191>
-fn p10_outdoor_32x16_quarter_scan(x: usize, y: usize) -> [usize; 2] {
+fn p10_outdoor_32x16_quarter_scan(x: usize, y: usize) -> Option<[usize; 2]> {
     let cell_starting_point = (x / 8) * 32;
     let delta_x = x % 8;
-    let offset = (3 - (y / 4)) * 8;
-    [cell_starting_point + delta_x + offset, y % 4]
+    let offset = 3usize.checked_sub(y / 4)? * 8;
+    Some([cell_starting_point + delta_x + offset, y % 4])
 }
 
 /// P3 RGB panel 64x64 with the pattern
@@ -394,12 +465,12 @@ fn p3_outdoor_64x64(rows: usize, x: usize, y: usize) -> [usize; 2] {
     [matrix_x, stripe_row(rows, y)]
 }
 
-fn double_z(rows: usize, cols: usize, x: usize, y: usize) -> [usize; 2] {
+fn double_z(rows: usize, cols: usize, x: usize, y: usize) -> Option<[usize; 2]> {
     let quarter_rows = rows / 4;
     let quarter_cols = cols / 4;
 
-    let y_quarter = y / quarter_rows; // 0..3
-    let x_quarter = x / quarter_cols; // 0..3
+    let y_quarter = y.checked_div(quarter_rows)?; // 0..3
+    let x_quarter = x.checked_div(quarter_cols)?; // 0..3
 
     let offset_y = y % quarter_rows;
     let mut offset_x = x % quarter_cols;
@@ -419,10 +490,10 @@ fn double_z(rows: usize, cols: usize, x: usize, y: usize) -> [usize; 2] {
         quarter_cols + offset_x
     };
 
-    [
+    Some([
         base_x + top_offset,
         (y_quarter / 2) * quarter_rows + offset_y,
-    ]
+    ])
 }
 
 /// P4 outdoor panel with 80x40 pixels.
@@ -445,20 +516,20 @@ fn p4_outdoor_80x40(x: usize, y: usize) -> [usize; 2] {
 const P8_TILE_WIDTH: usize = 8;
 const P8_TILE_HEIGHT: usize = 5;
 
-fn p8_outdoor_1r1g1b(x: usize, y: usize) -> [usize; 2] {
+/// Only covers the 40x20 pixels of a P8 panel; the layout runs backwards, so larger panels would underflow.
+fn p8_outdoor_1r1g1b(x: usize, y: usize) -> Option<[usize; 2]> {
     let vblock_is_even = (y / P8_TILE_HEIGHT).is_multiple_of(2);
+    let tile_base = P8_TILE_WIDTH * (1 + P8_TILE_WIDTH).checked_sub(2 * (x / P8_TILE_WIDTH))?;
     let matrix_x = if vblock_is_even {
-        P8_TILE_WIDTH * (1 + P8_TILE_WIDTH - 2 * (x / P8_TILE_WIDTH)) + P8_TILE_WIDTH
-            - (x % P8_TILE_WIDTH)
-            - 1
+        tile_base + P8_TILE_WIDTH - (x % P8_TILE_WIDTH) - 1
     } else {
-        P8_TILE_WIDTH * (1 + P8_TILE_WIDTH - 2 * (x / P8_TILE_WIDTH)) - P8_TILE_WIDTH
-            + (x % P8_TILE_WIDTH)
+        tile_base.checked_sub(P8_TILE_WIDTH)? + (x % P8_TILE_WIDTH)
     };
 
-    let matrix_y =
-        (P8_TILE_HEIGHT - y % P8_TILE_HEIGHT) + P8_TILE_HEIGHT * (1 - y / (P8_TILE_HEIGHT * 2)) - 1;
-    [matrix_x, matrix_y]
+    let matrix_y = (P8_TILE_HEIGHT - y % P8_TILE_HEIGHT)
+        + P8_TILE_HEIGHT * 1usize.checked_sub(y / (P8_TILE_HEIGHT * 2))?
+        - 1;
+    Some([matrix_x, matrix_y])
 }
 
 #[cfg(test)]
@@ -469,23 +540,99 @@ mod tests {
     fn quarter_scan_has_half_the_vertical_stretch() {
         let mut mapper = MultiplexMapperType::P10Outdoor32x16QuarterScan.create();
         let (mut rows, mut cols) = (16, 32);
-        mapper.edit_rows_cols(&mut rows, &mut cols);
+        mapper.edit_rows_cols(&mut rows, &mut cols).unwrap();
         assert_eq!((rows, cols), (8, 128));
         // The panel only uses the upper data lines, so the canvas is as tall as the panel.
         assert_eq!(mapper.get_size_mapping(128, 8).unwrap(), [32, 16]);
         // The panel of the second parallel chain starts after the 8 rows of the first chain.
-        assert_eq!(mapper.map_visible_to_matrix(128, 16, 0, 16), [24, 8]);
-        assert_eq!(mapper.map_visible_to_matrix(128, 8, 0, 0), [24, 0]);
-        assert_eq!(mapper.map_visible_to_matrix(128, 8, 9, 5), [49, 1]);
+        assert_eq!(mapper.map_visible_to_matrix(128, 16, 0, 16), Some([24, 8]));
+        assert_eq!(mapper.map_visible_to_matrix(128, 8, 0, 0), Some([24, 0]));
+        assert_eq!(mapper.map_visible_to_matrix(128, 8, 9, 5), Some([49, 1]));
     }
 
     #[test]
     fn p4_outdoor_80x40_reverses_even_tiles() {
         let mut mapper = MultiplexMapperType::P4Outdoor80x40.create();
         let (mut rows, mut cols) = (40, 80);
-        mapper.edit_rows_cols(&mut rows, &mut cols);
-        assert_eq!(mapper.map_visible_to_matrix(160, 20, 0, 0), [7, 0]);
-        assert_eq!(mapper.map_visible_to_matrix(160, 20, 0, 10), [8, 0]);
-        assert_eq!(mapper.map_visible_to_matrix(160, 20, 9, 21), [22, 11]);
+        mapper.edit_rows_cols(&mut rows, &mut cols).unwrap();
+        assert_eq!(mapper.map_visible_to_matrix(160, 20, 0, 0), Some([7, 0]));
+        assert_eq!(mapper.map_visible_to_matrix(160, 20, 0, 10), Some([8, 0]));
+        assert_eq!(mapper.map_visible_to_matrix(160, 20, 9, 21), Some([22, 11]));
+    }
+
+    #[test]
+    fn rejects_panel_sizes_that_the_layout_cannot_split() {
+        for (kind, rows, cols) in [
+            (MultiplexMapperType::Spiral, 16, 2),
+            (MultiplexMapperType::Spiral, 2, 32),
+            (MultiplexMapperType::DoubleZ, 32, 6),
+            (MultiplexMapperType::Stripe, 6, 32),
+            (MultiplexMapperType::Checkered, 16, 3),
+            (MultiplexMapperType::Kaler2Scan, 18, 32),
+            (MultiplexMapperType::P10Z, 0, 32),
+        ] {
+            let mut mapper = kind.create();
+            let (mut r, mut c) = (rows, cols);
+            assert!(mapper.edit_rows_cols(&mut r, &mut c).is_err(), "{kind:?}");
+            // The size is left alone.
+            assert_eq!((r, c), (rows, cols));
+        }
+    }
+
+    #[test]
+    fn fixed_layouts_report_pixels_they_dont_cover() {
+        // A P10 panel has 16 rows and a P8 panel 40x20 pixels; larger panels would underflow.
+        let mut mapper = MultiplexMapperType::P10Z.create();
+        let (mut rows, mut cols) = (32, 32);
+        mapper.edit_rows_cols(&mut rows, &mut cols).unwrap();
+        assert!(mapper.map_visible_to_matrix(cols, rows, 31, 15).is_some());
+        assert_eq!(mapper.map_visible_to_matrix(cols, rows, 31, 20), None);
+        let mut mapper = MultiplexMapperType::P8Outdoor1R1G1B.create();
+        let (mut rows, mut cols) = (40, 80);
+        mapper.edit_rows_cols(&mut rows, &mut cols).unwrap();
+        assert!(mapper.map_visible_to_matrix(cols, rows, 39, 19).is_some());
+        assert_eq!(mapper.map_visible_to_matrix(cols, rows, 79, 0), None);
+        assert_eq!(mapper.map_visible_to_matrix(cols, rows, 0, 39), None);
+    }
+
+    #[test]
+    fn creating_maps_with_unsupported_sizes_fails_instead_of_panicking() {
+        use crate::{RGBMatrix, RGBMatrixConfig};
+        for (multiplexing, rows, cols) in [
+            (MultiplexMapperType::P10Z, 32, 32),
+            (MultiplexMapperType::P8Outdoor1R1G1B, 40, 80),
+            (MultiplexMapperType::Spiral, 16, 2),
+            (MultiplexMapperType::DoubleZ, 32, 6),
+        ] {
+            let mut config = RGBMatrixConfig {
+                rows,
+                cols,
+                multiplexing: Some(multiplexing),
+                ..Default::default()
+            };
+            assert!(
+                RGBMatrix::create_pixel_map(&mut config).is_err(),
+                "{multiplexing:?}"
+            );
+        }
+        // The sizes these layouts are made for still work.
+        for (multiplexing, rows, cols) in [
+            (MultiplexMapperType::P10Z, 16, 32),
+            (MultiplexMapperType::P8Outdoor1R1G1B, 20, 40),
+            (MultiplexMapperType::Spiral, 16, 32),
+            (MultiplexMapperType::DoubleZ, 32, 64),
+            (MultiplexMapperType::Kaler2Scan, 16, 32),
+        ] {
+            let mut config = RGBMatrixConfig {
+                rows,
+                cols,
+                multiplexing: Some(multiplexing),
+                ..Default::default()
+            };
+            assert!(
+                RGBMatrix::create_pixel_map(&mut config).is_ok(),
+                "{multiplexing:?}"
+            );
+        }
     }
 }

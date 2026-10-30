@@ -384,7 +384,11 @@ impl Rp1Pio {
         self.transfer()
     }
 
-    pub(crate) fn dump(&mut self, canvas: &Canvas, pwm_low_bit: usize) {
+    pub(crate) fn dump(
+        &mut self,
+        canvas: &Canvas,
+        pwm_low_bit: usize,
+    ) -> Result<(), MatrixCreationError> {
         build_frame(
             &self.layout,
             &self.active_words,
@@ -392,9 +396,7 @@ impl Rp1Pio {
             pwm_low_bit,
             &mut self.buffer,
         );
-        if let Err(error) = self.transfer() {
-            panic!("{error}");
-        }
+        self.transfer()
     }
 }
 

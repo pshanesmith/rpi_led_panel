@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use argh::FromArgs;
 
 use crate::{
@@ -27,9 +29,14 @@ pub struct RGBMatrixConfig {
     /// the number of display columns. Default: 64
     #[argh(option, default = "64")]
     pub cols: usize,
-    /// the display refresh rate. Default: 120
+    /// the display refresh rate, between 1 and 100000. Default: 120
     #[argh(option, default = "120")]
     pub refresh_rate: usize,
+    /// refresh the panels as fast as possible instead of waiting for the next frame of the refresh rate, which
+    /// is then ignored. This uses the whole core and makes the refresh rate depend on the configuration.
+    /// Default: false
+    #[argh(option, default = "false")]
+    pub uncapped_refresh_rate: bool,
     /// the Raspberry Pi chip model e.g. "BCM2711", Default: automatic
     #[argh(option)]
     pub pi_chip: Option<PiChip>,
@@ -109,6 +116,17 @@ pub struct RGBMatrixConfig {
     /// makes the refresh rate less stable. Default: true
     #[argh(option, default = "true")]
     pub busy_waiting: bool,
+    /// run the refresh thread with the real-time SCHED_FIFO policy at this priority (1 to 99) instead of the
+    /// highest normal priority (nice -20). This also disables most of the kernel's real-time throttling, so
+    /// only use it with the refresh core isolated (`isolcpus=3` in /boot/firmware/cmdline.txt on a 4 core Pi):
+    /// otherwise the thread can starve everything else scheduled on that core, including kernel threads, which
+    /// can stall the system or trigger the watchdog. Needs root or CAP_SYS_NICE. Default: off
+    #[argh(option)]
+    pub realtime_priority: Option<u8>,
+    /// clear the canvas that `RGBMatrix::update_on_vsync` returns. Turn it off if every frame redraws all
+    /// pixels anyway: the returned canvas then still holds an older frame. Default: true
+    #[argh(option, default = "true")]
+    pub clear_on_vsync: bool,
     /// on a Raspberry Pi 5, use the PIO state machine of the RP1 I/O controller to clock out the data, instead of
     /// setting the GPIO pins from the CPU. This needs the kernel's PIO driver (/dev/pio0). Default: false
     #[argh(option, default = "false")]
@@ -124,7 +142,20 @@ pub struct RGBMatrixConfig {
     pub drop_priv_group: String,
 }
 
+/// The highest refresh rate that is accepted. Faster frames than 10 µs are not possible anyway.
+pub(crate) const MAX_REFRESH_RATE: usize = 100_000;
+
 impl RGBMatrixConfig {
+    /// How long each frame should take, or `None` to refresh as fast as possible.
+    pub(crate) fn frame_time_target(&self) -> Option<Duration> {
+        if self.uncapped_refresh_rate {
+            return None;
+        }
+        // Validated to be between 1 and `MAX_REFRESH_RATE`, so this neither truncates nor divides by zero.
+        let rate = self.refresh_rate.clamp(1, MAX_REFRESH_RATE) as u64;
+        Some(Duration::from_nanos(1_000_000_000 / rate))
+    }
+
     pub(crate) const fn double_rows(&self) -> usize {
         self.rows / SUB_PANELS
     }
@@ -135,7 +166,7 @@ impl RGBMatrixConfig {
         std::array::from_fn(|b| {
             let timing = timing_ns;
             if b >= self.dither_bits {
-                timing_ns *= 2;
+                timing_ns = timing_ns.saturating_mul(2);
             }
             timing
         })
@@ -149,6 +180,7 @@ impl Default for RGBMatrixConfig {
             rows: 64,
             cols: 64,
             refresh_rate: 120,
+            uncapped_refresh_rate: false,
             pi_chip: None,
             pwm_bits: 11,
             pwm_lsb_nanoseconds: 130,
@@ -167,6 +199,8 @@ impl Default for RGBMatrixConfig {
             inverse_colors: false,
             show_refresh: false,
             busy_waiting: true,
+            realtime_priority: None,
+            clear_on_vsync: true,
             rp1_pio: false,
             drop_privs: true,
             drop_priv_user: String::from("daemon"),

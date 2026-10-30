@@ -22,3 +22,37 @@ jobs:
       run: cargo test --verbose
     - name: Run tests with wide GPIO
       run: cargo test --verbose --features wide-gpio
+
+  clippy:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v7
+    - name: Install clippy
+      run: rustup component add clippy
+    - name: Clippy
+      run: cargo clippy --all-targets -- -D warnings
+    - name: Clippy with wide GPIO
+      run: cargo clippy --all-targets --features wide-gpio -- -D warnings
+
+  # The library runs on the Raspberry Pi, so check that it builds for its targets. Checking doesn't link, so no
+  # cross toolchain is needed.
+  cross-check:
+
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        target: [ aarch64-unknown-linux-gnu, armv7-unknown-linux-gnueabihf ]
+
+    steps:
+    - uses: actions/checkout@v7
+    - name: Install target
+      run: rustup target add ${{ matrix.target }} && rustup component add clippy
+    - name: Check
+      run: cargo check --all-targets --target ${{ matrix.target }}
+    - name: Clippy
+      run: cargo clippy --all-targets --target ${{ matrix.target }} -- -D warnings
+    - name: Clippy with wide GPIO
+      run: cargo clippy --all-targets --features wide-gpio --target ${{ matrix.target }} -- -D warnings

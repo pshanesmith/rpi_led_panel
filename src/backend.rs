@@ -60,12 +60,18 @@ impl Backend {
         Ok(())
     }
 
-    pub(crate) fn dump(&mut self, canvas: &Canvas, pwm_low_bit: usize) {
+    /// Shows one frame. Only the PIO backend can fail, if the kernel driver rejects the transfer.
+    pub(crate) fn dump(
+        &mut self,
+        canvas: &Canvas,
+        pwm_low_bit: usize,
+    ) -> Result<(), MatrixCreationError> {
         match self {
             Self::Bcm(backend) => backend.dump(canvas, pwm_low_bit),
             Self::Rp1Rio(rio) => rio.dump(canvas, pwm_low_bit),
-            Self::Rp1Pio(pio) => pio.dump(canvas, pwm_low_bit),
+            Self::Rp1Pio(pio) => return pio.dump(canvas, pwm_low_bit),
         }
+        Ok(())
     }
 
     /// Turns the requested pins into inputs, as far as they are available. GPIO inputs and outputs are not
@@ -107,8 +113,7 @@ pub(crate) struct BcmBackend {
 impl BcmBackend {
     fn new(chip: PiChip, config: &RGBMatrixConfig) -> Result<Self, MatrixCreationError> {
         let row_setter = config.row_setter.create(config);
-        let gpio =
-            Gpio::new(chip, config, row_setter.as_ref()).map_err(MatrixCreationError::GpioError)?;
+        let gpio = Gpio::new(chip, config, row_setter.as_ref())?;
         Ok(Self {
             gpio,
             row_setter,
@@ -170,5 +175,13 @@ impl BcmBackend {
                 gpio.send_pulse(b);
             }
         }
+    }
+}
+
+impl Drop for BcmBackend {
+    /// Like [`Rp1Rio`], leaves the LEDs off and the pins as inputs, except the output enable, see
+    /// [`Gpio::release`].
+    fn drop(&mut self) {
+        self.gpio.release();
     }
 }

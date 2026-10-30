@@ -305,6 +305,7 @@ impl Canvas {
     }
 
     /// Writes the mapped color to the bit planes of a pixel.
+    #[inline]
     fn write_pixel(&mut self, designator: PixelDesignator, [red, green, blue]: [u16; 3]) {
         let PixelDesignator {
             gpio_word,
@@ -318,25 +319,22 @@ impl Canvas {
             return;
         }
         let pos_start = gpio_word as usize;
-
+        let cols = self.cols;
         let min_bit_plane = K_BIT_PLANES - self.pwm_bits;
 
-        (min_bit_plane..K_BIT_PLANES).for_each(|plane| {
-            let pos = pos_start + self.cols * plane;
-            let mask = 1 << plane;
-            let mut color_bits = 0;
-            if (red & mask) != 0 {
-                color_bits |= r_bit;
-            };
-            if (green & mask) != 0 {
-                color_bits |= g_bit;
-            };
-            if (blue & mask) != 0 {
-                color_bits |= b_bit;
-            };
-            self.bitplane_buffer[pos] &= designator_mask;
-            self.bitplane_buffer[pos] |= color_bits;
-        });
+        // The words of the pixel in the shown bit planes, one every `cols` words. Taking the whole range as one
+        // slice checks the bounds once instead of once per plane, still without any unsafe code.
+        let first = pos_start + cols * min_bit_plane;
+        let last = pos_start + cols * (K_BIT_PLANES - 1);
+        let Some(words) = self.bitplane_buffer.get_mut(first..=last) else {
+            return;
+        };
+        for (plane, word) in (min_bit_plane..K_BIT_PLANES).zip(words.iter_mut().step_by(cols)) {
+            // All ones if the bit of the color is set in this plane, else zero, without branches.
+            let bit = |value: u16| GpioBits::from((value >> plane) & 1).wrapping_neg();
+            let color_bits = (bit(red) & r_bit) | (bit(green) & g_bit) | (bit(blue) & b_bit);
+            *word = (*word & designator_mask) | color_bits;
+        }
     }
 
     pub fn set_pixel(&mut self, x: usize, y: usize, r: u8, g: u8, b: u8) {
@@ -345,6 +343,31 @@ impl Canvas {
         };
         let color = self.map_color(r, g, b);
         self.write_pixel(designator, color);
+    }
+
+    /// Sets the pixels of row `y` from `x` on to the `[r, g, b]` colors, which is faster than calling
+    /// [`Canvas::set_pixel`] for each of them. Pixels outside of the canvas are skipped.
+    pub fn set_row(&mut self, x: usize, y: usize, colors: &[[u8; 3]]) {
+        if y >= self.height() || x >= self.width() {
+            return;
+        }
+        let colors = &colors[..colors.len().min(self.width() - x)];
+        let mapper = Arc::clone(&self.shared_mapper);
+        let row_start = y * mapper.width + x;
+        let designators = &mapper.buffer[row_start..row_start + colors.len()];
+        // Neighbouring pixels often have the same color, so the last mapped color is reused.
+        let mut last: Option<([u8; 3], [u16; 3])> = None;
+        for (&designator, &rgb) in designators.iter().zip(colors) {
+            let color = match last {
+                Some((last_rgb, color)) if last_rgb == rgb => color,
+                _ => {
+                    let color = self.map_color(rgb[0], rgb[1], rgb[2]);
+                    last = Some((rgb, color));
+                    color
+                }
+            };
+            self.write_pixel(designator, color);
+        }
     }
 
     /// Sets the pixels of the `width` x `height` rectangle at `x`, `y` to the `[r, g, b]` colors, row by row.
@@ -360,8 +383,12 @@ impl Canvas {
         if width == 0 {
             return;
         }
-        for (i, &[r, g, b]) in colors.iter().take(width * height).enumerate() {
-            self.set_pixel(x + i % width, y + i / width, r, g, b);
+        let colors = &colors[..colors.len().min(width.saturating_mul(height))];
+        for (row, row_colors) in colors.chunks(width).enumerate() {
+            let Some(row_y) = y.checked_add(row) else {
+                return;
+            };
+            self.set_row(x, row_y, row_colors);
         }
     }
 
@@ -677,6 +704,122 @@ mod tests {
         let mut clipped = canvas(&config);
         clipped.sub_fill(62, 62, 10, 10, 255, 255, 255);
         clipped.set_pixels(62, 0, 4, 1, &[[255, 255, 255]; 4]);
+    }
+
+    /// The reference: [`Canvas::set_pixel`] for every pixel, with the bit planes written one by one.
+    fn slow_set_pixel(canvas: &mut Canvas, x: usize, y: usize, [r, g, b]: [u8; 3]) {
+        let Some(&designator) = canvas.shared_mapper.get(x, y) else {
+            return;
+        };
+        if !designator.is_used() {
+            return;
+        }
+        let [red, green, blue] = canvas.map_color(r, g, b);
+        for plane in K_BIT_PLANES - canvas.pwm_bits..K_BIT_PLANES {
+            let pos = designator.gpio_word as usize + canvas.cols * plane;
+            let mask = 1 << plane;
+            let mut color_bits = 0;
+            if red & mask != 0 {
+                color_bits |= designator.r_bit;
+            }
+            if green & mask != 0 {
+                color_bits |= designator.g_bit;
+            }
+            if blue & mask != 0 {
+                color_bits |= designator.b_bit;
+            }
+            canvas.bitplane_buffer[pos] &= designator.mask;
+            canvas.bitplane_buffer[pos] |= color_bits;
+        }
+    }
+
+    /// Some colors that cover all bits, with repeats.
+    fn test_color(i: usize) -> [u8; 3] {
+        let v = (i * 37 % 256) as u8;
+        [
+            v,
+            v.wrapping_mul(7),
+            if i.is_multiple_of(5) { 255 } else { v / 3 },
+        ]
+    }
+
+    #[test]
+    fn fast_paths_match_the_slow_path() {
+        let configs = [
+            RGBMatrixConfig::default(),
+            RGBMatrixConfig {
+                rows: 32,
+                cols: 32,
+                chain_length: 2,
+                parallel: 2,
+                pwm_bits: 7,
+                inverse_colors: true,
+                led_sequence: LedSequence::Bgr,
+                ..Default::default()
+            },
+            RGBMatrixConfig {
+                rows: 16,
+                cols: 32,
+                chain_length: 2,
+                pixelmapper: vec!["Remap:32,16|0,0n|0,0x".parse().unwrap()],
+                ..Default::default()
+            },
+            RGBMatrixConfig {
+                rows: 16,
+                cols: 32,
+                multiplexing: Some(crate::MultiplexMapperType::Spiral),
+                pixelmapper: vec![crate::NamedPixelMapperType::Rotate(90)],
+                ..Default::default()
+            },
+        ];
+        for mut config in configs {
+            let map = Arc::new(crate::RGBMatrix::create_pixel_map(&mut config).unwrap());
+            let mut slow = Canvas::new(&config, Arc::clone(&map));
+            slow.fill(1, 2, 3);
+            slow.set_brightness(60);
+            let (width, height) = (slow.width(), slow.height());
+            let mut by_pixel = slow.clone();
+            let mut by_row = slow.clone();
+            let mut by_rect = slow.clone();
+            let colors: Vec<[u8; 3]> = (0..width * height).map(test_color).collect();
+            for y in 0..height {
+                for x in 0..width {
+                    let color = colors[y * width + x];
+                    slow_set_pixel(&mut slow, x, y, color);
+                    by_pixel.set_pixel(x, y, color[0], color[1], color[2]);
+                }
+                by_row.set_row(0, y, &colors[y * width..(y + 1) * width]);
+            }
+            by_rect.set_pixels(0, 0, width, height, &colors);
+            let expected = slow.serialize();
+            assert_eq!(by_pixel.serialize(), expected, "set_pixel {config:?}");
+            assert_eq!(by_row.serialize(), expected, "set_row {config:?}");
+            assert_eq!(by_rect.serialize(), expected, "set_pixels {config:?}");
+
+            // Partial and clipped rows.
+            let mut slow_part = Canvas::new(&config, Arc::clone(&map));
+            let mut fast_part = slow_part.clone();
+            let run: Vec<[u8; 3]> = (0..width + 5).map(test_color).collect();
+            for (x, y) in [(3, 1), (width - 2, height - 1), (width, 0), (0, height)] {
+                for (i, &color) in run.iter().enumerate() {
+                    slow_set_pixel(&mut slow_part, x + i, y, color);
+                }
+                fast_part.set_row(x, y, &run);
+            }
+            assert_eq!(fast_part.serialize(), slow_part.serialize(), "{config:?}");
+        }
+    }
+
+    #[test]
+    fn set_row_ignores_rows_outside_and_empty_input() {
+        let config = RGBMatrixConfig::default();
+        let mut canvas = canvas(&config);
+        let before = canvas.serialize();
+        canvas.set_row(0, 64, &[[255; 3]; 64]);
+        canvas.set_row(64, 0, &[[255; 3]; 4]);
+        canvas.set_row(0, 0, &[]);
+        canvas.set_pixels(usize::MAX, usize::MAX, 4, 4, &[[255; 3]; 16]);
+        assert_eq!(canvas.serialize(), before);
     }
 
     #[test]
