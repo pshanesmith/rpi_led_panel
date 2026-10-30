@@ -414,9 +414,11 @@ impl RGBMatrix {
                             Ok((new_canvas, multiple)) => {
                                 next_canvas = Some(new_canvas);
                                 frame_multiple = multiple.max(1);
-                                suspended = false;
-                                // Show it right away.
-                                frame_count = 0;
+                                if suspended {
+                                    // Show the first canvas after resuming right away.
+                                    suspended = false;
+                                    frame_count = 0;
+                                }
                             }
                             Err(TryRecvError::Disconnected) => {
                                 break 'thread;

@@ -64,7 +64,7 @@ Merged from upstream:
 - The colors are rounded like upstream, instead of rounded down.
 - The frame rate is timed with the monotonic clock instead of the system timer of the BCM chips.
 - Privileges are only dropped when running as root.
-
+- The waits for pulses and frames wake up `min_sys_sleep_microseconds` (default 100) early and busy wait the rest, instead of the previous fixed 200 µs threshold and 50 µs margin. Use `--min-sys-sleep-microseconds 200` for the old threshold.
 - Report warnings and suggestions through the `log` crate instead of printing them to stderr. A logger such as `env_logger` is needed to see them.
 - Add more detail to error messages and implement `Error::source` for errors caused by I/O failures.
 - Declare 1.88 as the minimum supported Rust version.
