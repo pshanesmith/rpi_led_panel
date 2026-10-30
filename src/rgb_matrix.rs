@@ -1,56 +1,58 @@
 use std::{
     error::Error,
     fmt::{Display, Formatter},
-    fs::{OpenOptions, write},
+    fs::{File, write},
     io::Write,
     mem::replace,
-    sync::Arc,
     sync::atomic::{AtomicU32, Ordering},
     sync::mpsc::{
         Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError, channel,
         sync_channel,
     },
-    thread::{JoinHandle, sleep, spawn},
+    sync::{Arc, Mutex},
+    thread::{Builder, JoinHandle, sleep},
     time::{Duration, Instant},
 };
-use thread_priority::{ThreadPriority, set_current_thread_priority};
+use thread_priority::{
+    RealtimeThreadSchedulePolicy, ThreadPriority, ThreadSchedulePolicy,
+    set_current_thread_priority, set_thread_priority_and_policy, thread_native_id,
+};
 
 use crate::{
     RGBMatrixConfig,
     backend::Backend,
     canvas::{Canvas, PixelDesignator, PixelDesignatorMap},
     chip::PiChip,
-    config::K_BIT_PLANES,
+    config::{K_BIT_PLANES, MAX_REFRESH_RATE},
     gpio::GpioInitializationError,
     named_pixel_mapper::MappingDirection,
+    pin_pulser::uses_hardware_pulse,
     pixel_mapper::PixelMapper,
-    registers::{STORE_BARRIER_SUPPORTED, UserGpioOutputs},
+    registers::{STORE_BARRIER_SUPPORTED, UserGpioOutputs, open_dev_mem},
     row_address_setter::RowAddressSetterType,
     rp1::is_pi5_model,
-    utils::{FrameRateMonitor, linux_has_isol_cpu, set_thread_affinity, sleep_at_most},
+    utils::{FrameRateMonitor, linux_has_isol_cpu, set_thread_affinity, sleep_at_most, warning},
 };
 
 /// How many input changes are kept until they are received.
 const INPUT_QUEUE_LENGTH: usize = 256;
 
-fn initialize_update_thread(chip: PiChip) {
+/// The name of the thread that refreshes the panels, as shown by e.g. `top -H`.
+const REFRESH_THREAD_NAME: &str = "led-refresh";
+
+fn initialize_update_thread(chip: PiChip, realtime_priority: Option<u8>) {
     // Pin the thread to the last core to avoid the flicker resulting from context switching.
     let last_core_id = chip.num_cores() - 1;
     if !set_thread_affinity(last_core_id) {
-        eprintln!("Could not pin the display update thread to core {last_core_id}.");
+        warning!("Could not pin the display update thread to core {last_core_id}.");
     }
 
     // If the user has not setup isolcpus, let them know about the performance improvement.
     if chip.num_cores() > 1 && !linux_has_isol_cpu(last_core_id) {
-        eprintln!(
+        warning!(
             "Suggestion: to slightly improve display update, add\n\tisolcpus={last_core_id}\nat \
-            the end of /boot/cmdline.txt and reboot"
+            the end of /boot/firmware/cmdline.txt (/boot/cmdline.txt on older systems) and reboot"
         );
-    }
-
-    // Disable realtime throttling.
-    if chip.num_cores() > 1 && write("/proc/sys/kernel/sched_rt_runtime_us", "999000").is_err() {
-        eprintln!("Could not disable realtime throttling");
     }
 
     // Set the last core to performance mode.
@@ -61,16 +63,51 @@ fn initialize_update_thread(chip: PiChip) {
         )
         .is_err()
     {
-        eprintln!(
-            "Could not set core {} to performance mode.",
-            last_core_id + 1
-        );
+        warning!("Could not set core {last_core_id} to performance mode.");
     }
 
-    // Set the highest thread priority.
-    if set_current_thread_priority(ThreadPriority::Max).is_err() {
-        eprintln!("Could not set thread priority. This might lead to reduced performance.",);
+    if let Some(priority) = realtime_priority
+        && set_realtime_priority(chip, priority)
+    {
+        return;
     }
+
+    // The highest priority of the normal scheduling policy, which is nice -20 on Linux.
+    if set_current_thread_priority(ThreadPriority::Max).is_err() {
+        warning!(
+            "Could not raise the priority of the display update thread (nice -20). This might lead to reduced \
+            performance."
+        );
+    }
+}
+
+/// Switches the current thread to the real-time SCHED_FIFO policy. Returns `true` on success.
+fn set_realtime_priority(chip: PiChip, priority: u8) -> bool {
+    // Real-time threads are throttled to 95% of the time by default, which shows as flicker. Leave 1 ms per
+    // second for the rest of the system, like upstream. This only matters for real-time threads.
+    if chip.num_cores() > 1 && write("/proc/sys/kernel/sched_rt_runtime_us", "999000").is_err() {
+        warning!(
+            "Could not reduce the real-time throttling (/proc/sys/kernel/sched_rt_runtime_us)."
+        );
+    }
+    let result = ThreadPriority::try_from(priority)
+        .map_err(|e| e.to_string())
+        .and_then(|priority| {
+            set_thread_priority_and_policy(
+                thread_native_id(),
+                priority,
+                ThreadSchedulePolicy::Realtime(RealtimeThreadSchedulePolicy::Fifo),
+            )
+            .map_err(|e| format!("{e:?}"))
+        });
+    if let Err(error) = result {
+        warning!(
+            "Could not switch the display update thread to SCHED_FIFO priority {priority} ({error}), using the \
+            normal policy."
+        );
+        return false;
+    }
+    true
 }
 
 #[derive(Debug)]
@@ -125,6 +162,34 @@ impl Display for MatrixCreationError {
     }
 }
 
+/// Why a canvas could not be shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MatrixUpdateError {
+    /// The display update thread has stopped, with the reason.
+    ThreadStopped(String),
+}
+
+impl Error for MatrixUpdateError {}
+
+impl Display for MatrixUpdateError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MatrixUpdateError::ThreadStopped(reason) => {
+                write!(f, "The display update thread stopped: {reason}")
+            }
+        }
+    }
+}
+
+/// Extracts the message of a panic.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(ToString::to_string)
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
+}
+
 /// Requests from the user to the display update thread.
 enum Control {
     Shutdown,
@@ -145,12 +210,21 @@ pub struct RGBMatrix {
     canvas_from_thread_receiver: Receiver<Box<Canvas>>,
     /// Additional requested inputs that can be received.
     enabled_input_bits: u32,
-    /// The registers to write the outputs of the user. Not available on the Raspberry Pi 5.
+    /// The chip, to map the registers for the user's outputs.
+    chip: PiChip,
+    /// `/dev/mem`, opened before the privileges are dropped, to map the user's outputs when they are requested.
+    /// Not available on the Raspberry Pi 5.
+    dev_mem: Option<File>,
+    /// The registers to write the outputs of the user, once requested.
     user_outputs: Option<UserGpioOutputs>,
     /// The pins that the user can write to.
     enabled_output_bits: u32,
     /// Frame rate measurement.
     framerate: Arc<AtomicU32>,
+    /// Why the update thread stopped, if it did.
+    thread_error: Arc<Mutex<Option<String>>>,
+    /// Whether the canvases that are handed back are cleared.
+    clear_on_vsync: bool,
 }
 
 impl RGBMatrix {
@@ -175,20 +249,20 @@ impl RGBMatrix {
         };
         let uses_rp1 = chip.uses_rp1() || is_pi5_model();
 
-        // Check if we can access the memory before doing anything else. The Raspberry Pi 5 doesn't need it.
-        if !uses_rp1 {
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open("/dev/mem")
-                .map_err(|_| MatrixCreationError::MemoryAccessError)?;
-        }
+        // Check if we can access the memory before doing anything else. The Raspberry Pi 5 doesn't need it. It
+        // stays open for the user's outputs, as the update thread drops the privileges.
+        let dev_mem = if uses_rp1 {
+            None
+        } else {
+            Some(open_dev_mem().map_err(|_| MatrixCreationError::MemoryAccessError)?)
+        };
 
         let max_parallel = config.hardware_mapping.max_parallel_chains();
         if config.parallel > max_parallel {
             return Err(MatrixCreationError::TooManyParallelChains(max_parallel));
         }
         Self::validate_config(&config)?;
+        Self::validate_for_backend(&config, uses_rp1)?;
 
         let shared_mapper = Self::create_pixel_map(&mut config)?;
 
@@ -204,9 +278,6 @@ impl RGBMatrix {
         let canvas = Box::new(Canvas::new(&config, Arc::new(shared_mapper)));
         let mut thread_canvas = canvas.clone();
 
-        // The update thread drops the privileges, so map the registers for the user's outputs before.
-        let user_outputs = (!uses_rp1).then(|| UserGpioOutputs::new(chip));
-
         let (canvas_to_thread_sender, canvas_to_thread_receiver) =
             sync_channel::<(Box<Canvas>, u32)>(0);
         let (canvas_from_thread_sender, canvas_from_thread_receiver) =
@@ -217,123 +288,142 @@ impl RGBMatrix {
             channel::<Result<u32, MatrixCreationError>>();
         let framerate = Arc::new(AtomicU32::new(0));
         let mut frame_rate_monitor = FrameRateMonitor::new(framerate.clone());
+        let thread_error = Arc::new(Mutex::new(None));
+        let thread_error_sender = Arc::clone(&thread_error);
+        let clear_on_vsync = config.clear_on_vsync;
 
-        let thread_handle = spawn(move || {
-            initialize_update_thread(chip);
+        let spawn_result = Builder::new()
+            .name(REFRESH_THREAD_NAME.to_string())
+            .spawn(move || {
+                initialize_update_thread(chip, config.realtime_priority);
 
-            let mut backend = match Backend::new(chip, &config) {
-                Ok(backend) => backend,
-                Err(error) => {
-                    // If sending fails, the main thread has already given up waiting.
+                let mut backend = match Backend::new(chip, &config) {
+                    Ok(backend) => backend,
+                    Err(error) => {
+                        // If sending fails, the main thread has already given up waiting.
+                        thread_start_result_sender.send(Err(error)).ok();
+                        return;
+                    }
+                };
+
+                // Run the initialization sequence if necessary.
+                if let Some(panel_type) = config.panel_type
+                    && let Err(error) = backend.init_panels(&panel_type.init(&config))
+                {
                     thread_start_result_sender.send(Err(error)).ok();
                     return;
                 }
-            };
 
-            // Run the initialization sequence if necessary.
-            if let Some(panel_type) = config.panel_type
-                && let Err(error) = backend.init_panels(&panel_type.init(&config))
-            {
-                thread_start_result_sender.send(Err(error)).ok();
-                return;
-            }
+                let mut last_gpio_inputs: u32 = 0;
 
-            let mut last_gpio_inputs: u32 = 0;
+                // Dither sequence
+                let mut dither_low_bit_sequence = 0;
 
-            // Dither sequence
-            let mut dither_low_bit_sequence = 0;
+                // `None` refreshes as fast as possible.
+                let frame_time_target = config.frame_time_target();
 
-            let frame_time_target = Duration::from_secs(1) / config.refresh_rate as u32;
+                // The canvas to show next, and for how many frames to show the current one before.
+                let mut next_canvas: Option<Box<Canvas>> = None;
+                let mut frame_multiple = 1;
+                let mut frame_count: u32 = 0;
+                let mut refresh_display = config.show_refresh.then(RefreshRateDisplay::new);
 
-            // The canvas to show next, and for how many frames to show the current one before.
-            let mut next_canvas: Option<Box<Canvas>> = None;
-            let mut frame_multiple = 1;
-            let mut frame_count: u32 = 0;
-            let mut refresh_display = config.show_refresh.then(RefreshRateDisplay::new);
+                let enabled_input_bits = backend.request_inputs(requested_inputs);
+                if thread_start_result_sender
+                    .send(Ok(enabled_input_bits))
+                    .is_err()
+                {
+                    // The main thread has already given up waiting.
+                    return;
+                }
 
-            let enabled_input_bits = backend.request_inputs(requested_inputs);
-            if thread_start_result_sender
-                .send(Ok(enabled_input_bits))
-                .is_err()
-            {
-                // The main thread has already given up waiting.
-                return;
-            }
-
-            'thread: loop {
-                let start_time = Instant::now();
-                loop {
-                    match control_receiver.try_recv() {
-                        Ok(Control::RequestOutputs(bits, reply)) => {
-                            reply.send(backend.request_outputs(bits)).ok();
+                'thread: loop {
+                    let start_time = Instant::now();
+                    loop {
+                        match control_receiver.try_recv() {
+                            Ok(Control::RequestOutputs(bits, reply)) => {
+                                reply.send(backend.request_outputs(bits)).ok();
+                            }
+                            Ok(Control::Shutdown) | Err(TryRecvError::Disconnected) => {
+                                break 'thread;
+                            }
+                            Err(TryRecvError::Empty) => break,
                         }
-                        Ok(Control::Shutdown) | Err(TryRecvError::Disconnected) => break 'thread,
-                        Err(TryRecvError::Empty) => break,
                     }
-                }
-                // Read input bits and send them if they have changed.
-                let new_inputs = backend.read_inputs();
-                if new_inputs != last_gpio_inputs {
-                    match input_sender.try_send(new_inputs) {
-                        Ok(()) => last_gpio_inputs = new_inputs,
-                        // Nobody is receiving the inputs. Try again in the next frame.
-                        Err(TrySendError::Full(_)) => {}
-                        Err(TrySendError::Disconnected(_)) => break 'thread,
-                    }
-                }
-                // Check for a swap canvas.
-                if next_canvas.is_none() {
-                    match canvas_to_thread_receiver.try_recv() {
-                        Ok((new_canvas, multiple)) => {
-                            next_canvas = Some(new_canvas);
-                            frame_multiple = multiple.max(1);
+                    // Read input bits and send them if they have changed.
+                    let new_inputs = backend.read_inputs();
+                    if new_inputs != last_gpio_inputs {
+                        match input_sender.try_send(new_inputs) {
+                            Ok(()) => last_gpio_inputs = new_inputs,
+                            // Nobody is receiving the inputs. Try again in the next frame.
+                            Err(TrySendError::Full(_)) => {}
+                            Err(TrySendError::Disconnected(_)) => break 'thread,
                         }
-                        Err(TryRecvError::Disconnected) => {
-                            break 'thread;
+                    }
+                    // Check for a swap canvas.
+                    if next_canvas.is_none() {
+                        match canvas_to_thread_receiver.try_recv() {
+                            Ok((new_canvas, multiple)) => {
+                                next_canvas = Some(new_canvas);
+                                frame_multiple = multiple.max(1);
+                            }
+                            Err(TryRecvError::Disconnected) => {
+                                break 'thread;
+                            }
+                            Err(TryRecvError::Empty) => {}
                         }
-                        Err(TryRecvError::Empty) => {}
+                    }
+                    // Only swap after the requested number of frames.
+                    if frame_count.is_multiple_of(frame_multiple) {
+                        frame_count = 0;
+                        if let Some(new_canvas) = next_canvas.take() {
+                            let old_canvas = replace(&mut thread_canvas, new_canvas);
+                            let Ok(()) = canvas_from_thread_sender.send(old_canvas) else {
+                                break 'thread;
+                            };
+                        }
+                    }
+
+                    if let Err(error) = backend.dump(
+                        &thread_canvas,
+                        dither_start_bits[dither_low_bit_sequence % dither_start_bits.len()],
+                    ) {
+                        // Keep the reason for the user, who gets an error on the next update.
+                        *thread_error_sender
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) = Some(error.to_string());
+                        return;
+                    }
+                    dither_low_bit_sequence += 1;
+                    frame_count += 1;
+
+                    frame_rate_monitor.update();
+
+                    // Wait for the rest of the frame.
+                    if let Some(frame_time_target) = frame_time_target {
+                        let end_time = start_time + frame_time_target;
+                        if config.busy_waiting {
+                            sleep_at_most(end_time.saturating_duration_since(Instant::now()));
+                            while Instant::now() < end_time {
+                                std::hint::spin_loop();
+                            }
+                        } else {
+                            sleep(end_time.saturating_duration_since(Instant::now()));
+                        }
+                    }
+
+                    if let Some(display) = refresh_display.as_mut() {
+                        display.update(start_time.elapsed());
                     }
                 }
-                // Only swap after the requested number of frames.
-                if frame_count.is_multiple_of(frame_multiple) {
-                    frame_count = 0;
-                    if let Some(new_canvas) = next_canvas.take() {
-                        let old_canvas = replace(&mut thread_canvas, new_canvas);
-                        let Ok(()) = canvas_from_thread_sender.send(old_canvas) else {
-                            break 'thread;
-                        };
-                    }
-                }
 
-                backend.dump(
-                    &thread_canvas,
-                    dither_start_bits[dither_low_bit_sequence % dither_start_bits.len()],
-                );
-                dither_low_bit_sequence += 1;
-                frame_count += 1;
-
-                frame_rate_monitor.update();
-
-                // Wait for the rest of the frame.
-                let end_time = start_time + frame_time_target;
-                if config.busy_waiting {
-                    sleep_at_most(end_time.saturating_duration_since(Instant::now()));
-                    while Instant::now() < end_time {
-                        std::hint::spin_loop();
-                    }
-                } else {
-                    sleep(end_time.saturating_duration_since(Instant::now()));
-                }
-
-                if let Some(display) = refresh_display.as_mut() {
-                    display.update(start_time.elapsed());
-                }
-            }
-
-            // Turn it off.
-            thread_canvas.fill(0, 0, 0);
-            backend.dump(&thread_canvas, 0);
-        });
+                // Turn it off. Dropping the backend afterwards releases the pins.
+                thread_canvas.fill(0, 0, 0);
+                let _ = backend.dump(&thread_canvas, 0);
+            });
+        let thread_handle = spawn_result.map_err(|error| {
+            MatrixCreationError::ThreadPanicked(format!("could not start the thread: {error}"))
+        })?;
 
         let enabled_input_bits =
             match thread_start_result_receiver.recv_timeout(Duration::from_secs(10)) {
@@ -342,11 +432,7 @@ impl RGBMatrix {
                 Err(RecvTimeoutError::Disconnected) => {
                     // The thread exited without reporting back, so it must have panicked.
                     let message = match thread_handle.join() {
-                        Err(payload) => payload
-                            .downcast_ref::<&str>()
-                            .map(ToString::to_string)
-                            .or_else(|| payload.downcast_ref::<String>().cloned())
-                            .unwrap_or_else(|| "unknown panic".to_string()),
+                        Err(payload) => panic_message(payload.as_ref()),
                         Ok(()) => "thread exited unexpectedly".to_string(),
                     };
                     return Err(MatrixCreationError::ThreadPanicked(message));
@@ -360,9 +446,13 @@ impl RGBMatrix {
             canvas_to_thread_sender,
             canvas_from_thread_receiver,
             enabled_input_bits,
-            user_outputs,
+            chip,
+            dev_mem,
+            user_outputs: None,
             enabled_output_bits: 0,
             framerate,
+            thread_error,
+            clear_on_vsync,
         };
 
         Ok((rgbmatrix, canvas))
@@ -373,11 +463,15 @@ impl RGBMatrix {
     pub(crate) fn create_pixel_map(
         config: &mut RGBMatrixConfig,
     ) -> Result<PixelDesignatorMap, MatrixCreationError> {
-        let multiplex_mapper = config.multiplexing.as_ref().map(|mapper_type| {
-            let mut mapper = mapper_type.create();
-            mapper.edit_rows_cols(&mut config.rows, &mut config.cols);
-            mapper
-        });
+        let multiplex_mapper = config
+            .multiplexing
+            .as_ref()
+            .map(|mapper_type| {
+                let mut mapper = mapper_type.create();
+                mapper.edit_rows_cols(&mut config.rows, &mut config.cols)?;
+                Ok::<_, MatrixCreationError>(mapper)
+            })
+            .transpose()?;
         // The multiplexer changes the electrical layout, which has to be supported as well.
         Self::validate_rows(config.rows)?;
 
@@ -420,15 +514,27 @@ impl RGBMatrix {
                 config.pwm_bits
             ));
         }
-        // The PWM clock divider is `pwm_lsb_nanoseconds / 4` and needs to fit in 12 bits.
-        if !(4..16384).contains(&config.pwm_lsb_nanoseconds) {
+        // The on-time doubles for each of the bit planes after the lowest, which must not overflow.
+        let max_lsb_nanoseconds = u32::MAX >> (K_BIT_PLANES - 1);
+        if !(1..=max_lsb_nanoseconds).contains(&config.pwm_lsb_nanoseconds) {
             return invalid(format!(
-                "pwm_lsb_nanoseconds must be between 4 and 16383, got {}.",
+                "pwm_lsb_nanoseconds must be between 1 and {max_lsb_nanoseconds}, got {}.",
                 config.pwm_lsb_nanoseconds
             ));
         }
-        if config.refresh_rate == 0 {
-            return invalid("refresh_rate must be at least 1.".to_string());
+        // The rate is ignored without a cap, but is still checked so that turning it on later can't fail.
+        if !(1..=MAX_REFRESH_RATE).contains(&config.refresh_rate) {
+            return invalid(format!(
+                "refresh_rate must be between 1 and {MAX_REFRESH_RATE}, got {}.",
+                config.refresh_rate
+            ));
+        }
+        if let Some(priority) = config.realtime_priority
+            && !(1..=99).contains(&priority)
+        {
+            return invalid(format!(
+                "realtime_priority must be between 1 and 99, got {priority}."
+            ));
         }
         if let Some(slowdown) = config.slowdown {
             if !(-1..=60).contains(&slowdown) {
@@ -445,6 +551,26 @@ impl RGBMatrix {
             return invalid(
                 "The B707ShiftRegister row setter does not support interlacing.".to_string(),
             );
+        }
+        Ok(())
+    }
+
+    /// Checks the limits of the hardware that drives the panels.
+    fn validate_for_backend(
+        config: &RGBMatrixConfig,
+        uses_rp1: bool,
+    ) -> Result<(), MatrixCreationError> {
+        // The PWM clock divider of the BCM hardware pulses is `pwm_lsb_nanoseconds / 4` and needs to fit in 12
+        // bits. The software pulses and the Raspberry Pi 5 don't have this limit.
+        if !uses_rp1
+            && uses_hardware_pulse(config)
+            && !(4..16384).contains(&config.pwm_lsb_nanoseconds)
+        {
+            return Err(MatrixCreationError::InvalidConfig(format!(
+                "pwm_lsb_nanoseconds must be between 4 and 16383 with hardware pulses, got {}. Use a wiring \
+                 without hardware pulses or set hardware_pulse to false for other values.",
+                config.pwm_lsb_nanoseconds
+            )));
         }
         Ok(())
     }
@@ -482,8 +608,15 @@ impl RGBMatrix {
             MappingDirection::VisibleToMatrix => {
                 for y in 0..new_height {
                     for x in 0..new_width {
-                        let [orig_x, orig_y] =
-                            mapper.map_visible_to_matrix(old_width, old_height, x, y);
+                        let [orig_x, orig_y] = mapper
+                            .map_visible_to_matrix(old_width, old_height, x, y)
+                            .ok_or_else(|| {
+                                MatrixCreationError::PixelMapperError(format!(
+                                    "The pixel mapper can't map pixel ({x}, {y}) of the \
+                                     {new_width}x{new_height} canvas. The panel size might not be \
+                                     supported."
+                                ))
+                            })?;
                         let orig_designator = shared_mapper
                             .get(orig_x, orig_y)
                             .ok_or_else(invalid_dimensions)?;
@@ -504,7 +637,7 @@ impl RGBMatrix {
                             .get_mut(new_x, new_y)
                             .ok_or_else(invalid_dimensions)?;
                         if new_designator.is_used() && !collision_reported {
-                            eprintln!(
+                            warning!(
                                 "Warning: pixel mapper maps more than one pixel to ({new_x}, {new_y})."
                             );
                             collision_reported = true;
@@ -518,11 +651,17 @@ impl RGBMatrix {
     }
 
     /// Updates the matrix with the new canvas. Blocks until the end of the current frame.
-    /// This returns a cleared canvas that has to be drawn to before calling this function again.
+    /// This returns a cleared canvas that has to be drawn to before calling this function again
+    /// (unless `clear_on_vsync` is turned off in the config).
     /// If this function is not called before the next frame update, the previous
     /// frame is drawn again.
     ///
     /// The returned canvas has the same brightness, PWM bits and luminance correction as the one passed in.
+    ///
+    /// # Panics
+    ///
+    /// If the display update thread has stopped, e.g. because the Raspberry Pi 5 PIO driver failed. Use
+    /// [`RGBMatrix::try_update_on_vsync`] to handle that.
     pub fn update_on_vsync(&mut self, canvas: Box<Canvas>) -> Box<Canvas> {
         self.update_on_vsync_every(canvas, 1)
     }
@@ -530,35 +669,71 @@ impl RGBMatrix {
     /// Like [`RGBMatrix::update_on_vsync`], but the current canvas is shown for a multiple of `frames` frames
     /// before the new one. This gives a stable frame rate that is a fraction of the refresh rate, e.g. for
     /// animations.
+    ///
+    /// # Panics
+    ///
+    /// If the display update thread has stopped, see [`RGBMatrix::try_update_on_vsync_every`].
     pub fn update_on_vsync_every(&mut self, canvas: Box<Canvas>, frames: u32) -> Box<Canvas> {
-        let Self {
-            canvas_to_thread_sender,
-            canvas_from_thread_receiver,
-            ..
-        } = self;
+        self.try_update_on_vsync_every(canvas, frames)
+            .unwrap_or_else(|error| panic!("Display update thread shut down unexpectedly: {error}"))
+    }
 
+    /// Like [`RGBMatrix::update_on_vsync`], but returns an error instead of panicking if the display update
+    /// thread has stopped. The matrix can't show anything after that.
+    pub fn try_update_on_vsync(
+        &mut self,
+        canvas: Box<Canvas>,
+    ) -> Result<Box<Canvas>, MatrixUpdateError> {
+        self.try_update_on_vsync_every(canvas, 1)
+    }
+
+    /// Like [`RGBMatrix::update_on_vsync_every`], but returns an error instead of panicking if the display
+    /// update thread has stopped.
+    pub fn try_update_on_vsync_every(
+        &mut self,
+        canvas: Box<Canvas>,
+        frames: u32,
+    ) -> Result<Box<Canvas>, MatrixUpdateError> {
         let brightness = canvas.brightness();
         let pwm_bits = canvas.pwm_bits();
         let luminance_correct = canvas.luminance_correct();
 
-        canvas_to_thread_sender
-            .send((canvas, frames))
-            .expect("Display update thread shut down unexpectedly.");
-
-        let mut canvas = canvas_from_thread_receiver
-            .recv()
-            .expect("Display update thread shut down unexpectedly.");
+        if self.canvas_to_thread_sender.send((canvas, frames)).is_err() {
+            return Err(self.thread_stopped());
+        }
+        let Ok(mut canvas) = self.canvas_from_thread_receiver.recv() else {
+            return Err(self.thread_stopped());
+        };
 
         // Both canvases need the same settings, otherwise they would alternate between frames.
         canvas.set_brightness(brightness);
         canvas.set_pwm_bits(pwm_bits);
         canvas.set_luminance_correct(luminance_correct);
 
-        // Clear the canvas before handing it back to the user.
-        // There is no practical use for not clearing it here as we switch
-        // back and forth between two canvases.
-        canvas.fill(0, 0, 0);
-        canvas
+        // Clear the canvas before handing it back to the user, unless they redraw every pixel anyway. Without
+        // clearing, it holds the frame before the one that was just passed in, as the two canvases alternate.
+        if self.clear_on_vsync {
+            canvas.fill(0, 0, 0);
+        }
+        Ok(canvas)
+    }
+
+    /// Why the update thread stopped. Waits for it to finish if it is still shutting down.
+    fn thread_stopped(&mut self) -> MatrixUpdateError {
+        let mut thread_error = self.thread_error.lock().unwrap_or_else(|e| e.into_inner());
+        if thread_error.is_none()
+            && let Some(handle) = self.thread_handle.take()
+        {
+            *thread_error = Some(match handle.join() {
+                Err(payload) => format!("it panicked: {}", panic_message(payload.as_ref())),
+                Ok(()) => "it exited unexpectedly".to_string(),
+            });
+        }
+        MatrixUpdateError::ThreadStopped(
+            thread_error
+                .clone()
+                .unwrap_or_else(|| "unknown reason".to_string()),
+        )
     }
 
     /// Get the bits that were available for input.
@@ -574,10 +749,22 @@ impl RGBMatrix {
 
     /// Turns GPIO pins that are not used by the matrix into outputs, which can be set with
     /// [`RGBMatrix::output_gpio`]. Returns the pins that were available. GPIO outputs are not supported on the
-    /// Raspberry Pi 5.
+    /// Raspberry Pi 5. Returns 0 if the registers can't be mapped, see [`RGBMatrix::try_request_outputs`].
     pub fn request_outputs(&mut self, bits: u32) -> u32 {
+        self.try_request_outputs(bits).unwrap_or(0)
+    }
+
+    /// Like [`RGBMatrix::request_outputs`], but fails with [`MatrixCreationError::MemoryAccessError`] if the GPIO
+    /// registers for the outputs can't be mapped. They are only mapped on the first request.
+    pub fn try_request_outputs(&mut self, bits: u32) -> Result<u32, MatrixCreationError> {
+        let Some(dev_mem) = &self.dev_mem else {
+            return Ok(0);
+        };
         if self.user_outputs.is_none() {
-            return 0;
+            self.user_outputs = Some(
+                UserGpioOutputs::new(dev_mem, self.chip)
+                    .map_err(|_| MatrixCreationError::MemoryAccessError)?,
+            );
         }
         let (reply_sender, reply_receiver) = channel();
         if self
@@ -585,11 +772,11 @@ impl RGBMatrix {
             .send(Control::RequestOutputs(bits, reply_sender))
             .is_err()
         {
-            return 0;
+            return Ok(0);
         }
         let enabled = reply_receiver.recv().unwrap_or(0);
         self.enabled_output_bits |= enabled;
-        enabled
+        Ok(enabled)
     }
 
     /// Sets the outputs from [`RGBMatrix::request_outputs`] to the given values. Other bits are ignored.
@@ -766,8 +953,101 @@ mod tests {
                 row_setter: crate::RowAddressSetterType::B707ShiftRegister,
                 ..valid()
             },
+            RGBMatrixConfig {
+                refresh_rate: usize::MAX,
+                ..valid()
+            },
+            RGBMatrixConfig {
+                refresh_rate: 0,
+                uncapped_refresh_rate: true,
+                ..valid()
+            },
+            RGBMatrixConfig {
+                pwm_lsb_nanoseconds: u32::MAX,
+                ..valid()
+            },
+            RGBMatrixConfig {
+                realtime_priority: Some(0),
+                ..valid()
+            },
+            RGBMatrixConfig {
+                realtime_priority: Some(100),
+                ..valid()
+            },
         ] {
             assert!(RGBMatrix::validate_config(&config).is_err(), "{config:?}");
         }
+        for config in [
+            RGBMatrixConfig {
+                refresh_rate: 100_000,
+                ..valid()
+            },
+            RGBMatrixConfig {
+                realtime_priority: Some(50),
+                ..valid()
+            },
+            RGBMatrixConfig {
+                pwm_lsb_nanoseconds: 1,
+                ..valid()
+            },
+        ] {
+            assert!(RGBMatrix::validate_config(&config).is_ok(), "{config:?}");
+        }
+    }
+
+    #[test]
+    fn limits_pwm_lsb_only_for_hardware_pulses() {
+        use crate::HardwareMapping;
+        let config = |hardware_mapping, hardware_pulse, pwm_lsb_nanoseconds| RGBMatrixConfig {
+            hardware_mapping,
+            hardware_pulse,
+            pwm_lsb_nanoseconds,
+            ..Default::default()
+        };
+        let pwm = HardwareMapping::adafruit_hat_pwm();
+        let check = |config: &RGBMatrixConfig, uses_rp1| {
+            RGBMatrix::validate_config(config).is_ok()
+                && RGBMatrix::validate_for_backend(config, uses_rp1).is_ok()
+        };
+        // The PWM divider has 12 bits.
+        assert!(check(&config(pwm, true, 130), false));
+        assert!(!check(&config(pwm, true, 20_000), false));
+        assert!(!check(&config(pwm, true, 2), false));
+        // Software pulses, the Raspberry Pi 5 and wirings without the PWM pin have no such limit.
+        assert!(check(&config(pwm, false, 20_000), false));
+        assert!(check(&config(pwm, true, 20_000), true));
+        assert!(check(
+            &config(HardwareMapping::adafruit_hat(), true, 2),
+            false
+        ));
+    }
+
+    #[test]
+    fn computes_frame_times() {
+        use std::time::Duration;
+        let config = RGBMatrixConfig::default();
+        assert_eq!(
+            config.frame_time_target(),
+            Some(Duration::from_nanos(8_333_333))
+        );
+        let uncapped = RGBMatrixConfig {
+            uncapped_refresh_rate: true,
+            ..Default::default()
+        };
+        assert_eq!(uncapped.frame_time_target(), None);
+        let fastest = RGBMatrixConfig {
+            refresh_rate: 100_000,
+            ..Default::default()
+        };
+        assert_eq!(fastest.frame_time_target(), Some(Duration::from_micros(10)));
+    }
+
+    #[test]
+    fn describes_update_errors() {
+        let error = super::MatrixUpdateError::ThreadStopped("PIO failed".to_string());
+        assert_eq!(
+            error.to_string(),
+            "The display update thread stopped: PIO failed"
+        );
     }
 }

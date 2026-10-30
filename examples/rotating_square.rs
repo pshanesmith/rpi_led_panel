@@ -30,7 +30,7 @@ fn main() {
     let [min_x, max_x] = [center_x - display_square / 2, center_x + display_square / 2];
     let [min_y, max_y] = [center_y - display_square / 2, center_y + display_square / 2];
 
-    for step in 0.. {
+    for step in 0..=u64::MAX {
         let rotation_deg = step as f64 / 2.0;
         for canvas_x in 0..cols {
             for canvas_y in 0..rows {

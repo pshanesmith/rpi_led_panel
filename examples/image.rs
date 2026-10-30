@@ -28,7 +28,7 @@ fn main() {
         ),
     );
 
-    for step in 0.. {
+    for step in 0..=u64::MAX {
         // The canvas returned by `update_on_vsync` is already cleared.
         image.draw(canvas.as_mut()).unwrap();
         canvas = matrix.update_on_vsync(canvas);

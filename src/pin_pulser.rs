@@ -1,5 +1,5 @@
 use crate::{
-    gpio_bits,
+    RGBMatrixConfig, gpio_bits,
     hardware_mapping::GpioBits,
     registers::{ClkRegisters, GPIOFunction, GPIORegisters, PWMRegisters, TimeRegisters},
     utils::sleep_at_most,
@@ -9,6 +9,12 @@ const PWM_BASE_TIME_NS: u32 = 2;
 
 /// Output enable pins that can be driven by the PWM hardware.
 pub(crate) const HARDWARE_PULSE_PINS: [GpioBits; 2] = [gpio_bits!(18), gpio_bits!(12)];
+
+/// Whether the BCM backend times the output enable pulses with the PWM hardware for this configuration, which
+/// needs the PWM peripheral (and so conflicts with the on-board sound) and limits `pwm_lsb_nanoseconds`.
+pub(crate) fn uses_hardware_pulse(config: &RGBMatrixConfig) -> bool {
+    config.hardware_pulse && HARDWARE_PULSE_PINS.contains(&config.hardware_mapping.output_enable)
+}
 
 /// Generates the output enable pulses that light up the LEDs for the duration of a bit plane.
 pub(crate) enum PinPulser {

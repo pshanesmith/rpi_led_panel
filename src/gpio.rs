@@ -8,10 +8,11 @@ use crate::{
     chip::PiChip,
     gpio_bits,
     hardware_mapping::GpioBits,
-    pin_pulser::{HARDWARE_PULSE_PINS, HardwarePinPulser, PinPulser, TimerPinPulser},
+    pin_pulser::{HardwarePinPulser, PinPulser, TimerPinPulser, uses_hardware_pulse},
     registers::{
         ClkRegisters, GPIOFunction, GPIORegisters, PWMRegisters, TimeRegisters, store_barrier,
     },
+    rgb_matrix::MatrixCreationError,
     row_address_setter::RowAddressSetter,
     utils::{linux_has_module_loaded, sleep_nanos},
 };
@@ -64,6 +65,10 @@ pub(crate) struct Gpio {
     input_bits: GpioBits,
     output_bits: GpioBits,
     reserved_bits: GpioBits,
+    /// The pins that drive the matrix, which are turned back into inputs on drop (except the output enable).
+    matrix_bits: GpioBits,
+    /// The (active low) output enable pins.
+    output_enable: GpioBits,
     /// How many extra writes to wait after each GPIO change, or -1 to wait for a memory barrier.
     gpio_slowdown: i32,
 }
@@ -74,15 +79,20 @@ impl Gpio {
         chip: PiChip,
         config: &RGBMatrixConfig,
         address_setter: &dyn RowAddressSetter,
-    ) -> Result<Self, GpioInitializationError> {
-        if linux_has_module_loaded("snd_bcm2835") {
-            return Err(GpioInitializationError::SoundModuleLoaded);
+    ) -> Result<Self, MatrixCreationError> {
+        let hardware_pulse = uses_hardware_pulse(config);
+        // The sound driver uses the PWM peripheral, which is only a problem if we use it as well.
+        if hardware_pulse && linux_has_module_loaded("snd_bcm2835") {
+            return Err(MatrixCreationError::GpioError(
+                GpioInitializationError::SoundModuleLoaded,
+            ));
         }
 
-        let mut gpio_registers = GPIORegisters::new(chip);
-        let time_registers = TimeRegisters::new(chip);
-        let mut pwm_registers = PWMRegisters::new(chip);
-        let mut clk_registers = ClkRegisters::new(chip);
+        let memory_error = |_| MatrixCreationError::MemoryAccessError;
+        let mut gpio_registers = GPIORegisters::new(chip).map_err(memory_error)?;
+        let time_registers = TimeRegisters::new(chip).map_err(memory_error)?;
+        let mut pwm_registers = PWMRegisters::new(chip).map_err(memory_error)?;
+        let mut clk_registers = ClkRegisters::new(chip).map_err(memory_error)?;
 
         // Tell GPIO about all bits we intend to use.
         let mut all_used_bits: GpioBits = 0;
@@ -116,7 +126,9 @@ impl Gpio {
             output_bits &= !(input_bits | reserved_bits);
 
             if output_bits & gpio_bits!(4) != 0 && linux_has_module_loaded("w1_gpio") {
-                return Err(GpioInitializationError::OneWireProtocolEnabled);
+                return Err(MatrixCreationError::GpioError(
+                    GpioInitializationError::OneWireProtocolEnabled,
+                ));
             }
 
             (0..=MAX_AVAILABLE_BIT).for_each(|b| {
@@ -131,7 +143,7 @@ impl Gpio {
         let bitplane_timings = config.bitplane_timings_ns();
 
         let output_enable = config.hardware_mapping.output_enable;
-        let pin_pulser = if config.hardware_pulse && HARDWARE_PULSE_PINS.contains(&output_enable) {
+        let pin_pulser = if hardware_pulse {
             PinPulser::Hardware(HardwarePinPulser::new(
                 output_enable,
                 &bitplane_timings,
@@ -155,8 +167,38 @@ impl Gpio {
             input_bits,
             output_bits,
             reserved_bits,
+            matrix_bits: all_used_bits,
+            output_enable,
             gpio_slowdown,
         })
+    }
+
+    /// Stops the hardware pulses, switches the LEDs off with the output enable, and turns the other pins of the
+    /// matrix back into inputs. The output enable stays an output that is driven high (LEDs off): as an input,
+    /// the default pull-down of e.g. GPIO 18 would enable the LEDs again.
+    pub(crate) fn release(&mut self) {
+        if let PinPulser::Hardware(_) = self.pin_pulser {
+            self.wait_pulse_finished();
+            self.pwm_registers.reset_pwm();
+        }
+        // Drive the output enable inactive (high) from the GPIO instead of the PWM before letting go of it.
+        // Set the level latch first so the pin does not briefly drive low when it becomes an output.
+        self.gpio_registers.write_set_bits(self.output_enable);
+        store_barrier();
+        for b in 0..=MAX_AVAILABLE_BIT {
+            if self.output_enable & gpio_bits!(b) != 0 {
+                self.gpio_registers.select_function(b, GPIOFunction::Output);
+            }
+        }
+        self.set_bits(self.output_enable);
+        store_barrier();
+        let released = self.matrix_bits & !self.output_enable;
+        for b in 0..=MAX_AVAILABLE_BIT {
+            if released & gpio_bits!(b) != 0 {
+                self.gpio_registers.select_function(b, GPIOFunction::Input);
+            }
+        }
+        self.output_bits &= !released;
     }
 
     pub(crate) fn write_masked_bits(&mut self, value: GpioBits, mask: GpioBits) {
@@ -187,9 +229,10 @@ impl Gpio {
             store_barrier();
             return;
         }
-        // Writing nothing to a register takes as long as a real write.
+        // Writing nothing to a register takes as long as a real write. With the pins above 31 in use, clearing
+        // writes two registers, which would double the delay, so only one is written.
         for _ in 0..self.gpio_slowdown {
-            self.gpio_registers.write_clr_bits(0);
+            self.gpio_registers.write_nothing();
         }
     }
 

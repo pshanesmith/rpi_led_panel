@@ -29,21 +29,25 @@ impl PixelMapper {
         }
     }
 
-    /// Map where a visible pixel (x,y) is mapped to the underlying matrix (x,y).
+    /// Map where a visible pixel (x,y) is mapped to the underlying matrix (x,y), or `None` if the mapper can't
+    /// map it, e.g. because the panel is larger than the layout of a multiplexer.
     pub(crate) fn map_visible_to_matrix(
         &self,
         matrix_width: usize,
         matrix_height: usize,
         visible_x: usize,
         visible_y: usize,
-    ) -> [usize; 2] {
+    ) -> Option<[usize; 2]> {
         match self {
             PixelMapper::Multiplex(mapper) => {
                 mapper.map_visible_to_matrix(matrix_width, matrix_height, visible_x, visible_y)
             }
-            PixelMapper::Named(mapper) => {
-                mapper.map_visible_to_matrix(matrix_width, matrix_height, visible_x, visible_y)
-            }
+            PixelMapper::Named(mapper) => Some(mapper.map_visible_to_matrix(
+                matrix_width,
+                matrix_height,
+                visible_x,
+                visible_y,
+            )),
         }
     }
 

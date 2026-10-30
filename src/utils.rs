@@ -21,6 +21,20 @@ macro_rules! gpio_bits {
     };
 }
 
+/// Prints a diagnostic message of the library. All of the library's messages go through here, so that they can be
+/// routed elsewhere in one place. The crate doesn't depend on `log`, so they go to standard error.
+pub(crate) fn print_warning(message: std::fmt::Arguments<'_>) {
+    eprintln!("{message}");
+}
+
+/// Like `eprintln!`, through [`print_warning`].
+macro_rules! warning {
+    ($($arg:tt)*) => {
+        $crate::utils::print_warning(format_args!($($arg)*))
+    };
+}
+pub(crate) use warning;
+
 pub(crate) fn linux_has_module_loaded(name: &str) -> bool {
     let Ok(file) = File::open("/proc/modules") else {
         return false;

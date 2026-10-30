@@ -23,7 +23,8 @@ const GPIO_CTRL_OFFSET: usize = 0x4;
 const GPIO_STRIDE: usize = 0x8;
 const RIO_OUT_OFFSET: usize = 0x10000;
 const RIO_OE_OFFSET: usize = 0x10004;
-/// Writes to these aliases set or clear the written bits only.
+/// Writes to these aliases toggle, set or clear the written bits only.
+const RIO_XOR_ALIAS: usize = 0x1000;
 const RIO_SET_ALIAS: usize = 0x2000;
 const RIO_CLR_ALIAS: usize = 0x3000;
 /// The first pad register selects the voltage, the pins follow.
@@ -54,6 +55,8 @@ impl Rp1Rio {
             slowdown,
             word_ns,
             clock: layout.clock,
+            used_bits: layout.used_bits,
+            shadow: 0,
         };
         registers.configure_pins(&layout);
         Ok(Self {
@@ -133,6 +136,18 @@ struct RioRegisters {
     /// How long one pixel clock takes.
     word_ns: f64,
     clock: u32,
+    /// The pins of the matrix. The other outputs of bank 0 are left alone.
+    used_bits: u32,
+    /// What the matrix pins of the output register are set to, to toggle the changed ones.
+    shadow: u32,
+}
+
+/// The value to write to the XOR alias of the output register to set the pins in `mask` to `pins`, if they are at
+/// `shadow` now, and their new state. Pins outside of `mask` are never touched.
+#[inline(always)]
+fn masked_xor_update(shadow: u32, pins: u32, mask: u32) -> (u32, u32) {
+    let target = pins & mask;
+    ((shadow ^ target) & mask, target)
 }
 
 impl RioRegisters {
@@ -144,6 +159,16 @@ impl RioRegisters {
                 .add(byte_offset)
                 .cast::<u32>()
                 .write_volatile(value);
+        }
+    }
+
+    fn read(&self, byte_offset: usize) -> u32 {
+        unsafe {
+            self.map
+                .as_ptr()
+                .add(byte_offset)
+                .cast::<u32>()
+                .read_volatile()
         }
     }
 
@@ -172,6 +197,8 @@ impl RioRegisters {
             self.write(RIO_SET_ALIAS + RIO_OE_OFFSET, bit);
         }
         store_barrier();
+        // Start from the current state, so that only the matrix pins that change are toggled.
+        self.shadow = self.read(RIO_OUT_OFFSET) & self.used_bits;
         self.write_pins(layout.output_enable);
     }
 }
@@ -179,7 +206,11 @@ impl RioRegisters {
 impl RioOutput for RioRegisters {
     #[inline(always)]
     fn write_pins(&mut self, pins: u32) {
-        self.write(RIO_OUT_OFFSET, pins);
+        // A single write to the XOR alias changes all matrix pins at once (like writing the output register) but
+        // leaves the other pins of bank 0 alone. The write happens even if nothing changes, to keep the timing.
+        let (toggle, state) = masked_xor_update(self.shadow, pins, self.used_bits);
+        self.write(RIO_XOR_ALIAS + RIO_OUT_OFFSET, toggle);
+        self.shadow = state;
     }
 
     #[inline(always)]
@@ -302,7 +333,7 @@ fn busy_wait_ns(nanos: u64) {
 pub(crate) mod tests {
     use std::sync::Arc;
 
-    use super::{RioOutput, dump_frame};
+    use super::{RioOutput, dump_frame, masked_xor_update};
     use crate::{
         RGBMatrix, RGBMatrixConfig,
         canvas::Canvas,
@@ -346,6 +377,26 @@ pub(crate) mod tests {
         canvas.set_pixel(0, 0, 255, 0, 0);
         canvas.set_pixel(1, 3, 0, 0, 255);
         (config, canvas)
+    }
+
+    #[test]
+    fn xor_updates_only_touch_matrix_pins() {
+        let mask = 0b0110_1100;
+        // Whatever the other pins of the bank are doing, they are never toggled.
+        for other in [0, !mask, 0b1000_0001] {
+            let mut register = other & !mask;
+            let mut shadow = 0;
+            for pins in [0, 0b0100_0100, u32::MAX, 0b1001_0011, 0b0010_1000, 0] {
+                let (toggle, state) = masked_xor_update(shadow, pins, mask);
+                assert_eq!(toggle & !mask, 0);
+                register ^= toggle;
+                shadow = state;
+                assert_eq!(register & mask, pins & mask);
+                assert_eq!(register & !mask, other & !mask);
+            }
+        }
+        // Writing the same pins again toggles nothing.
+        assert_eq!(masked_xor_update(0b0100, 0b0100, mask), (0, 0b0100));
     }
 
     #[test]
