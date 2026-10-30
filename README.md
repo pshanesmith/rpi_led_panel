@@ -27,7 +27,7 @@ The `ComputeModule` hardware mapping supports up to 3 parallel chains. Enable th
 
 The panels are refreshed by a thread named `led-refresh`, pinned to the last core. By default it runs at the highest priority of the normal scheduler (nice -20). With `--realtime-priority <1-99>` it uses the real-time `SCHED_FIFO` policy instead and most of the kernel's real-time throttling is turned off, which can reduce flicker. Only do this with the refresh core isolated (`isolcpus=3` on a 4 core Pi, in `/boot/firmware/cmdline.txt`): otherwise the thread can starve everything else on that core, including kernel threads, and stall the system.
 
-`--uncapped-refresh-rate true` refreshes as fast as possible instead of at `--refresh-rate`. `--clear-on-vsync false` skips clearing the canvas returned by `update_on_vsync`, for programs that redraw every pixel anyway. `try_update_on_vsync` returns an error instead of panicking if the refresh thread has stopped.
+`--uncapped-refresh-rate true` refreshes as fast as possible instead of at `--refresh-rate`. `--clear-on-vsync false` skips clearing the canvas returned by `update_on_vsync`, for programs that redraw every pixel anyway. `update_on_vsync` returns an error if the refresh thread has stopped, and `suspend` blanks the display and pauses the thread until the next `update_on_vsync`. Warnings and suggestions are reported through the `log` crate, so a logger such as `env_logger` is needed to see them.
 
 ## Known limitations
 

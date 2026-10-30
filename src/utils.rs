@@ -21,20 +21,6 @@ macro_rules! gpio_bits {
     };
 }
 
-/// Prints a diagnostic message of the library. All of the library's messages go through here, so that they can be
-/// routed elsewhere in one place. The crate doesn't depend on `log`, so they go to standard error.
-pub(crate) fn print_warning(message: std::fmt::Arguments<'_>) {
-    eprintln!("{message}");
-}
-
-/// Like `eprintln!`, through [`print_warning`].
-macro_rules! warning {
-    ($($arg:tt)*) => {
-        $crate::utils::print_warning(format_args!($($arg)*))
-    };
-}
-pub(crate) use warning;
-
 pub(crate) fn linux_has_module_loaded(name: &str) -> bool {
     let Ok(file) = File::open("/proc/modules") else {
         return false;
@@ -173,26 +159,30 @@ impl FrameRateMonitor {
             .store(self.get_fps() as u32, Ordering::Relaxed);
     }
 
+    /// Stop measuring until the next update, so that the time in between is not counted as a frame.
+    pub(crate) fn pause(&mut self) {
+        self.last_time = None;
+        self.framerate.store(0, Ordering::Relaxed);
+    }
+
     pub(crate) fn get_fps(&self) -> f32 {
         WINDOW_LENGTH as f32 / self.times.iter().sum::<f32>()
     }
 }
 
-/// Sleep for as long as we are comfortable without overshooting. The OS usually wakes us up late, so we
-/// leave a margin that the caller is expected to busy-wait for.
-pub(crate) fn sleep_at_most(duration: time::Duration) {
-    const MIN_SYS_SLEEP_TIME: time::Duration = time::Duration::from_micros(200);
-    const SLEEP_JITTER_ALLOWANCE: time::Duration = time::Duration::from_micros(50);
-    if duration > MIN_SYS_SLEEP_TIME {
-        thread::sleep(duration - SLEEP_JITTER_ALLOWANCE);
+/// Sleep for as long as we are comfortable without overshooting. The OS usually wakes us up late, so we wake
+/// up `min_sys_sleep_time` early and the caller is expected to busy-wait for the rest.
+pub(crate) fn sleep_at_most(duration: time::Duration, min_sys_sleep_time: time::Duration) {
+    if duration > min_sys_sleep_time {
+        thread::sleep(duration - min_sys_sleep_time);
     }
 }
 
 /// Wait for the given number of nanoseconds, sleeping for longer durations and busy-waiting for the rest.
-pub(crate) fn sleep_nanos(nanos: u32) {
+pub(crate) fn sleep_nanos(nanos: u32, min_sys_sleep_time: time::Duration) {
     let start = time::Instant::now();
     let duration = time::Duration::from_nanos(u64::from(nanos));
-    sleep_at_most(duration);
+    sleep_at_most(duration, min_sys_sleep_time);
     while start.elapsed() < duration {
         std::hint::spin_loop();
     }

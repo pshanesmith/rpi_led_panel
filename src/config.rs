@@ -18,7 +18,7 @@ pub(crate) const SUB_PANELS: usize = 2;
 pub(crate) const K_BIT_PLANES: usize = 11;
 
 /// Configuration for an RGB matrix panel controller.
-#[derive(FromArgs, Debug, PartialEq, Eq, Hash)]
+#[derive(FromArgs, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RGBMatrixConfig {
     /// the display wiring e.g. "Regular", "AdafruitHat", "AdafruitHatPwm", etc. Default: "Regular"
     #[argh(option, default = "HardwareMapping::regular()")]
@@ -70,12 +70,16 @@ pub struct RGBMatrixConfig {
     /// else, like sound. Default: true
     #[argh(option, default = "true")]
     pub hardware_pulse: bool,
-    /// interlaced scan mode. Default: false
-    #[argh(option, default = "false")]
+    /// lower values reduce CPU usage but can make flickers more likely: waits wake up this early and busy wait
+    /// the rest. Default: 100
+    #[argh(option, default = "100")]
+    pub min_sys_sleep_microseconds: u64,
+    /// use interlaced scan instead of progressive scan
+    #[argh(switch)]
     pub interlaced: bool,
     /// the lower bits can be time dithered, i.e. their brightness contribution is achieved by only showing
     /// them some frames (this is possible, because the PWM is implemented as binary code modulation). This
-    /// will allow higher refresh rate (or same refresh rate with increased --pwm_lsb_nanoseconds). The
+    /// will allow higher refresh rate (or same refresh rate with increased --pwm-lsb-nanoseconds). The
     /// disadvantage could be slightly lower brightness, in particular for longer chains, and higher CPU use.
     /// CPU use is not of concern for Raspberry Pi 2, 3 and 4 (as we run on a dedicated core anyway) but
     /// probably for Raspberry Pi 1 or Pi Zero. Default: 0 (no dithering)
@@ -131,9 +135,13 @@ pub struct RGBMatrixConfig {
     /// setting the GPIO pins from the CPU. This needs the kernel's PIO driver (/dev/pio0). Default: false
     #[argh(option, default = "false")]
     pub rp1_pio: bool,
-    /// drop privileges from root after initialization. Default: true
-    #[argh(option, default = "true")]
-    pub drop_privs: bool,
+    /// GPIO pins to read as inputs, as a decimal bitmask in which bit n stands for GPIO n. Pins that the
+    /// matrix uses itself are skipped. GPIO inputs are not supported on the Raspberry Pi 5. Default: 0
+    #[argh(option, default = "0")]
+    pub input_bits: u32,
+    /// keep running as root instead of dropping privileges after initialization
+    #[argh(switch)]
+    pub no_drop_privs: bool,
     /// username or UID to drop privileges to. Default: daemon
     #[argh(option, default = "String::from(\"daemon\")")]
     pub drop_priv_user: String,
@@ -186,6 +194,7 @@ impl Default for RGBMatrixConfig {
             pwm_lsb_nanoseconds: 130,
             slowdown: None,
             hardware_pulse: true,
+            min_sys_sleep_microseconds: 100,
             interlaced: false,
             dither_bits: 0,
             chain_length: 1,
@@ -202,7 +211,8 @@ impl Default for RGBMatrixConfig {
             realtime_priority: None,
             clear_on_vsync: true,
             rp1_pio: false,
-            drop_privs: true,
+            input_bits: 0,
+            no_drop_privs: false,
             drop_priv_user: String::from("daemon"),
             drop_priv_group: String::from("daemon"),
         }

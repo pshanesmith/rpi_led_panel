@@ -41,7 +41,7 @@ impl Backend {
         // Drop privileges here as we no longer need root. Without root, e.g. with /dev/gpiomem0 on the
         // Raspberry Pi 5, there is nothing to drop.
         let is_root = unsafe { libc::geteuid() } == 0;
-        if config.drop_privs && is_root {
+        if !config.no_drop_privs && is_root {
             drop_privs(&config.drop_priv_user, &config.drop_priv_group).map_err(|e| {
                 MatrixCreationError::GpioError(
                     crate::gpio::GpioInitializationError::FailedPrivilegeDrop(e),

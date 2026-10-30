@@ -18,8 +18,9 @@ fn rotate([x, y]: [f64; 2], angle: f64) -> [f64; 2] {
 }
 
 fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let config: RGBMatrixConfig = argh::from_env();
-    let (mut matrix, mut canvas) = RGBMatrix::new(config, 0).expect("Matrix initialization failed");
+    let (mut matrix, mut canvas) = RGBMatrix::new(config).expect("Matrix initialization failed");
     // The canvas size includes chained panels and pixel mappers.
     let rows = canvas.height() as isize;
     let cols = canvas.width() as isize;
@@ -53,10 +54,12 @@ fn main() {
             }
         }
 
-        canvas = matrix.update_on_vsync(canvas);
+        canvas = matrix
+            .update_on_vsync(canvas)
+            .expect("The display update thread stopped");
 
         if step % 120 == 0 {
-            print!("\r{:>100}\rFramerate: {}", "", matrix.get_framerate());
+            print!("\r{:>100}\rFramerate: {}", "", matrix.framerate());
             std::io::stdout().flush().unwrap();
         }
     }

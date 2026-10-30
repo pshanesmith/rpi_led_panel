@@ -1,6 +1,7 @@
 use std::{
     error::Error,
     fmt::{Display, Formatter},
+    time::Duration,
 };
 
 use crate::{
@@ -23,10 +24,15 @@ const MAX_AVAILABLE_BIT: u8 = 31;
 #[cfg(feature = "wide-gpio")]
 const MAX_AVAILABLE_BIT: u8 = 45;
 
+/// An error while setting up the GPIO pins.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum GpioInitializationError {
+    /// The one-wire kernel module is loaded, which conflicts with a hardware mapping that uses GPIO 4.
     OneWireProtocolEnabled,
+    /// The sound module is loaded, which conflicts with the PWM peripheral used for hardware pulsing.
     SoundModuleLoaded,
+    /// Privileges could not be dropped, for the given reason.
     FailedPrivilegeDrop(String),
     /// The PIO state machine of the Raspberry Pi 5 could not be set up or used.
     Rp1Pio(String),
@@ -71,6 +77,8 @@ pub(crate) struct Gpio {
     output_enable: GpioBits,
     /// How many extra writes to wait after each GPIO change, or -1 to wait for a memory barrier.
     gpio_slowdown: i32,
+    /// Waits for the pulses wake up this early and busy wait the rest.
+    min_sys_sleep_time: Duration,
 }
 
 impl Gpio {
@@ -88,7 +96,7 @@ impl Gpio {
             ));
         }
 
-        let memory_error = |_| MatrixCreationError::MemoryAccessError;
+        let memory_error = MatrixCreationError::MemoryAccessError;
         let mut gpio_registers = GPIORegisters::new(chip).map_err(memory_error)?;
         let time_registers = TimeRegisters::new(chip).map_err(memory_error)?;
         let mut pwm_registers = PWMRegisters::new(chip).map_err(memory_error)?;
@@ -170,6 +178,7 @@ impl Gpio {
             matrix_bits: all_used_bits,
             output_enable,
             gpio_slowdown,
+            min_sys_sleep_time: Duration::from_micros(config.min_sys_sleep_microseconds),
         })
     }
 
@@ -250,7 +259,7 @@ impl Gpio {
             PinPulser::Timer(pulser) => {
                 let (pins, duration_ns) = pulser.pulse(bitplane);
                 self.clear_bits(pins);
-                sleep_nanos(duration_ns);
+                sleep_nanos(duration_ns, self.min_sys_sleep_time);
                 self.set_bits(pins);
             }
         }
@@ -261,11 +270,12 @@ impl Gpio {
             time_registers,
             pwm_registers,
             pin_pulser,
+            min_sys_sleep_time,
             ..
         } = self;
         // The timer based pulses are already finished when `send_pulse` returns.
         if let PinPulser::Hardware(pulser) = pin_pulser {
-            pulser.wait_pulse_finished(time_registers, pwm_registers);
+            pulser.wait_pulse_finished(time_registers, pwm_registers, *min_sys_sleep_time);
         }
     }
 

@@ -1,6 +1,6 @@
 use crate::error::InvalidVariantError;
 
-use std::{error::Error, ops::BitOr, str::FromStr};
+use std::{ops::BitOr, str::FromStr};
 
 use crate::gpio_bits;
 
@@ -94,6 +94,8 @@ impl Panels {
     }
 }
 
+/// The GPIO pins that the panels are connected to. There is a constructor for each supported wiring, which can
+/// also be selected by name when parsing, e.g. `"AdafruitHat"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HardwareMapping {
     pub(crate) output_enable: GpioBits,
@@ -110,7 +112,7 @@ pub struct HardwareMapping {
 }
 
 impl FromStr for HardwareMapping {
-    type Err = Box<dyn Error>;
+    type Err = InvalidVariantError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         #[derive(strum::EnumString, strum::VariantNames)]
@@ -218,7 +220,7 @@ impl HardwareMapping {
         }
     }
 
-    // An unmodified Adafruit HAT
+    /// An unmodified Adafruit HAT.
     #[must_use]
     pub const fn adafruit_hat() -> Self {
         Self {
@@ -252,7 +254,7 @@ impl HardwareMapping {
         }
     }
 
-    // An Adafruit HAT with the PWM modification
+    /// An Adafruit HAT with the PWM modification.
     #[must_use]
     pub const fn adafruit_hat_pwm() -> Self {
         Self {
@@ -493,5 +495,28 @@ mod tests {
     fn regular_pi1_does_not_overlap_row_address() {
         let mapping = HardwareMapping::regular_pi1();
         assert_eq!(mapping.used_bits(1) & mapping.e, 0);
+    }
+
+    #[test]
+    fn test_signals_use_distinct_pins() {
+        for (name, h) in [
+            ("Regular", HardwareMapping::regular()),
+            ("RegularPi1", HardwareMapping::regular_pi1()),
+            ("AdafruitHat", HardwareMapping::adafruit_hat()),
+            ("AdafruitHatPwm", HardwareMapping::adafruit_hat_pwm()),
+            ("Classic", HardwareMapping::classic()),
+            ("ClassicPi1", HardwareMapping::classic_pi1()),
+        ] {
+            let mut signals = vec![h.output_enable, h.clock, h.strobe, h.a, h.b, h.c, h.d, h.e];
+            for c in h.panels.color_bits {
+                signals.extend([c.r1, c.g1, c.b1, c.r2, c.g2, c.b2]);
+            }
+            // A signal can drive several pins, but no pin may be driven by two signals.
+            let mut used_bits = 0;
+            for bits in signals {
+                assert_eq!(used_bits & bits, 0, "{name} uses a pin twice");
+                used_bits |= bits;
+            }
+        }
     }
 }

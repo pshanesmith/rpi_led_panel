@@ -11,8 +11,9 @@ use rpi_led_panel::embedded_graphics::{
 use rpi_led_panel::{RGBMatrix, RGBMatrixConfig};
 
 fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let config: RGBMatrixConfig = argh::from_env();
-    let (mut matrix, mut canvas) = RGBMatrix::new(config, 0).expect("Matrix initialization failed");
+    let (mut matrix, mut canvas) = RGBMatrix::new(config).expect("Matrix initialization failed");
     // The canvas size includes chained panels and pixel mappers.
     let rows = canvas.height() as i32;
     let cols = canvas.width() as i32;
@@ -47,17 +48,19 @@ fn main() {
 
     for step in 0..=u64::MAX {
         // The canvas returned by `update_on_vsync` is already cleared.
-        circle.draw(canvas.as_mut()).unwrap();
+        circle.draw(&mut canvas).unwrap();
         [diagonal1, diagonal2, top, bottom, left, right]
             .iter()
-            .for_each(|line| line.draw(canvas.as_mut()).unwrap());
+            .for_each(|line| line.draw(&mut canvas).unwrap());
         if (step / 100) % 2 == 0 {
-            text.draw(canvas.as_mut()).unwrap();
+            text.draw(&mut canvas).unwrap();
         }
-        canvas = matrix.update_on_vsync(canvas);
+        canvas = matrix
+            .update_on_vsync(canvas)
+            .expect("The display update thread stopped");
 
         if step % 120 == 0 {
-            print!("\r{:>100}\rFramerate: {}", "", matrix.get_framerate());
+            print!("\r{:>100}\rFramerate: {}", "", matrix.framerate());
             std::io::stdout().flush().unwrap();
         }
     }
