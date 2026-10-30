@@ -5,6 +5,7 @@ use crate::{RGBMatrixConfig, error::InvalidVariantError, hardware_mapping::GpioB
     parse_err_fn = InvalidVariantError::new::<Self>,
     parse_err_ty = InvalidVariantError
 )]
+#[non_exhaustive]
 pub enum PanelType {
     #[strum(serialize = "FM6126", serialize = "FM6126A")]
     FM6126,

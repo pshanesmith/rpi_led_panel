@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::{
     RGBMatrixConfig, gpio_bits,
     hardware_mapping::GpioBits,
@@ -134,6 +136,7 @@ impl HardwarePinPulser {
         &mut self,
         time_registers: &mut TimeRegisters,
         pwm_registers: &mut PWMRegisters,
+        min_sys_sleep_time: Duration,
     ) {
         let Some(pulse) = self.current_pulse.take() else {
             return;
@@ -141,7 +144,7 @@ impl HardwarePinPulser {
 
         let already_elapsed_us = time_registers.get_time().saturating_sub(pulse.start_time);
         let remaining_time_us = u64::from(pulse.sleep_hint_us).saturating_sub(already_elapsed_us);
-        sleep_at_most(std::time::Duration::from_micros(remaining_time_us));
+        sleep_at_most(Duration::from_micros(remaining_time_us), min_sys_sleep_time);
 
         while !pwm_registers.fifo_empty() {
             // busy wait until done.

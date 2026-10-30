@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    fmt::{Debug, Formatter},
+    sync::Arc,
+};
 
 use crate::{
     RGBMatrixConfig,
@@ -15,6 +18,8 @@ pub(crate) enum Color {
     Blue,
 }
 
+/// The data lines that the red, green and blue channels of a pixel are sent to, in this order. Panels that swap
+/// their colors need something other than the default of [`LedSequence::Rgb`].
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, Hash, strum::EnumString, strum::VariantNames,
 )]
@@ -24,12 +29,18 @@ pub(crate) enum Color {
     parse_err_ty = InvalidVariantError
 )]
 pub enum LedSequence {
+    /// Red on R, green on G and blue on B.
     #[default]
     Rgb,
+    /// Red on R, green on B and blue on G.
     Rbg,
+    /// Red on G, green on R and blue on B.
     Grb,
+    /// Red on G, green on B and blue on R.
     Gbr,
+    /// Red on B, green on R and blue on G.
     Brg,
+    /// Red on B, green on G and blue on R.
     Bgr,
 }
 
@@ -217,6 +228,17 @@ pub struct Canvas {
     interlaced: bool,
 }
 
+impl Debug for Canvas {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Canvas")
+            .field("width", &self.width())
+            .field("height", &self.height())
+            .field("pwm_bits", &self.pwm_bits)
+            .field("brightness", &self.brightness)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Canvas {
     pub(crate) fn new(config: &RGBMatrixConfig, shared_mapper: Arc<PixelDesignatorMap>) -> Self {
         let color_lookup = &*CIE1931_LOOKUP;
@@ -241,11 +263,13 @@ impl Canvas {
         canvas
     }
 
+    /// The height in pixels. Multiple panels and pixel mappers can make this differ from the configured rows.
     #[must_use]
     pub fn height(&self) -> usize {
         self.shared_mapper.height
     }
 
+    /// The width in pixels. Multiple panels and pixel mappers can make this differ from the configured columns.
     #[must_use]
     pub fn width(&self) -> usize {
         self.shared_mapper.width
@@ -337,6 +361,7 @@ impl Canvas {
         }
     }
 
+    /// Set the color of a pixel. Pixels outside of the canvas are ignored.
     pub fn set_pixel(&mut self, x: usize, y: usize, r: u8, g: u8, b: u8) {
         let Some(&designator) = self.shared_mapper.get(x, y) else {
             return;
@@ -440,6 +465,7 @@ impl Canvas {
         plane_bits
     }
 
+    /// Set every pixel to the same color.
     pub fn fill(&mut self, r: u8, g: u8, b: u8) {
         let color = self.map_color(r, g, b);
         let black = self.map_color(0, 0, 0);
@@ -768,7 +794,7 @@ mod tests {
                 rows: 16,
                 cols: 32,
                 multiplexing: Some(crate::MultiplexMapperType::Spiral),
-                pixelmapper: vec![crate::NamedPixelMapperType::Rotate(90)],
+                pixelmapper: vec![crate::NamedPixelMapperType::Rotate(crate::Rotation::Deg90)],
                 ..Default::default()
             },
         ];

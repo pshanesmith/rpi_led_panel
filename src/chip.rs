@@ -1,12 +1,14 @@
-use std::fs::read_to_string;
+use std::fs::{read, read_to_string};
 
 use crate::error::InvalidVariantError;
 
+/// The chip of the Raspberry Pi, which determines the peripheral addresses and the default GPIO slowdown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, strum::EnumString, strum::VariantNames)]
 #[strum(
     parse_err_fn = InvalidVariantError::new::<Self>,
     parse_err_ty = InvalidVariantError
 )]
+#[non_exhaustive]
 pub enum PiChip {
     /// Model 0 and 1
     #[strum(serialize = "BCM2708", serialize = "BCM2835")]
@@ -33,15 +35,34 @@ impl PiChip {
     /// Try to automatically determine the model.
     #[must_use]
     pub fn determine() -> Option<Self> {
-        let revision = read_to_string("/proc/cpuinfo")
+        read_to_string("/proc/cpuinfo")
             .ok()
             .and_then(|cpuinfo| revision_from_cpuinfo(&cpuinfo))
             // Kernels that don't list the revision in /proc/cpuinfo still have it in the device tree.
             .or_else(|| {
-                let bytes = std::fs::read("/proc/device-tree/system/linux,revision").ok()?;
+                let bytes = read("/proc/device-tree/system/linux,revision").ok()?;
                 Some(u32::from_be_bytes(bytes.get(..4)?.try_into().ok()?))
-            })?;
-        Self::from_revision(revision)
+            })
+            .and_then(Self::from_revision)
+            // Provided by mainline kernels (Arch Linux ARM, Debian, Fedora, etc.), which have neither.
+            .or_else(|| {
+                Self::from_device_tree_compatible(&read("/proc/device-tree/compatible").ok()?)
+            })
+    }
+
+    /// The `compatible` property is a list of NUL-terminated strings, e.g.
+    /// `raspberrypi,4-model-b\0brcm,bcm2711\0`. Older Raspberry Pi kernels use the
+    /// `bcm2708`/`bcm2709`/`bcm2710` names.
+    fn from_device_tree_compatible(compatible: &[u8]) -> Option<Self> {
+        compatible.split(|&b| b == 0).find_map(|entry| match entry {
+            b"brcm,bcm2835" | b"brcm,bcm2708" => Some(Self::BCM2708),
+            b"brcm,bcm2836" | b"brcm,bcm2837" | b"brcm,bcm2709" | b"brcm,bcm2710" => {
+                Some(Self::BCM2709)
+            }
+            b"brcm,bcm2711" => Some(Self::BCM2711),
+            b"brcm,bcm2712" => Some(Self::BCM2712),
+            _ => None,
+        })
     }
 
     /// Get the chip from the revision code, see
@@ -121,5 +142,27 @@ mod tests {
         assert_eq!(chip("Revision\t: d04190"), Some(PiChip::BCM2712)); // 500
         assert_eq!(chip("Revision\t: c05170"), None); // Unknown processor
         assert_eq!(revision_from_cpuinfo("CPU revision\t: 3"), None);
+    }
+
+    #[test]
+    fn determines_chip_from_device_tree_compatible() {
+        let chip = PiChip::from_device_tree_compatible;
+        assert_eq!(
+            chip(b"raspberrypi,4-model-b\0brcm,bcm2711\0"),
+            Some(PiChip::BCM2711)
+        );
+        assert_eq!(
+            chip(b"raspberrypi,3-model-b\0brcm,bcm2837\0"),
+            Some(PiChip::BCM2709)
+        );
+        assert_eq!(
+            chip(b"raspberrypi,5-model-b\0brcm,bcm2712\0"),
+            Some(PiChip::BCM2712)
+        );
+        assert_eq!(
+            chip(b"raspberrypi,model-zero\0brcm,bcm2835\0"),
+            Some(PiChip::BCM2708)
+        );
+        assert_eq!(chip(b"pine64,rock64\0"), None);
     }
 }

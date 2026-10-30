@@ -20,6 +20,14 @@ Ported from the upstream C++ library:
   `Canvas::set_luminance_correct`. Solid fills with embedded-graphics use `sub_fill`.
 - `FM6126A` as a name for the `FM6126` panel type.
 
+Merged from upstream:
+
+- `RGBMatrix::suspend`/`RGBMatrix::is_suspended` to clear the display and pause the update thread until the next `update_on_vsync`.
+- The `min_sys_sleep_microseconds` option to tune how early sleeps wake up.
+- Export the `GpioInitializationError`, `InvalidVariantError`, `InvalidPixelMapperError` and `UpdateThreadError` types, and `Rotation` and `MirrorDirection`. `MatrixCreationError` and `GpioInitializationError` are `#[non_exhaustive]`.
+- `Clone` for `RGBMatrixConfig` and `Debug` for `RGBMatrix` and `Canvas`.
+- Document the public API.
+
 ### Fixed
 
 - Fix a panic when a pixel mapper makes the canvas taller than six panels, e.g. `Rotate:90` on a long chain or a 1:4 multiplexer with parallel chains.
@@ -46,18 +54,38 @@ Ported from the upstream C++ library:
 - Report pixel mappers that produce an empty canvas as an error.
 - Limit the queue of GPIO input changes so that it can't grow forever when nobody receives them.
 - Return an error instead of panicking when the user or group name to drop privileges to contains a NUL byte.
+- Fix a SIGBUS on aarch64 by reading the system timer as two 32-bit registers. [#28](https://github.com/EmbersArc/rpi_led_panel/pull/28)
+- Fix automatic chip detection on mainline kernels (through the device tree `compatible` property) and for old-style revision codes with the warranty bit set.
+- Fix the checks for loaded kernel modules and isolated CPUs, which could match the wrong module or CPU.
+- Validate `led_brightness` and `dither_bits` up front.
 
 ### Changed
 
 - The colors are rounded like upstream, instead of rounded down.
 - The frame rate is timed with the monotonic clock instead of the system timer of the BCM chips.
 - Privileges are only dropped when running as root.
-
+- The waits for pulses and frames wake up `min_sys_sleep_microseconds` (default 100) early and busy wait the rest, instead of the previous fixed 200 µs threshold and 50 µs margin. Use `--min-sys-sleep-microseconds 200` for the old threshold.
+- Report warnings and suggestions through the `log` crate instead of printing them to stderr. A logger such as `env_logger` is needed to see them.
+- Add more detail to error messages and implement `Error::source` for errors caused by I/O failures.
+- Declare 1.88 as the minimum supported Rust version.
+- Updated dependencies.
 - Share the pixel map and color lookup table between canvases and shrink the pixel map entries.
 - Leave a margin for the OS sleep jitter and busy-wait the rest, to avoid overshooting.
 
 ### Breaking
 
+- `RGBMatrix::new` returns a `Canvas` instead of a `Box<Canvas>`, and `RGBMatrix::update_on_vsync` and `RGBMatrix::update_on_vsync_every` take and return a `Canvas`, so `canvas.as_mut()` becomes `&mut canvas` when drawing.
+- `update_on_vsync` and `update_on_vsync_every` return a `Result` with an `UpdateThreadError` instead of panicking when the update thread shuts down unexpectedly. This replaces `try_update_on_vsync`, `try_update_on_vsync_every` and `MatrixUpdateError`.
+- `receive_new_inputs` returns a `Result<Option<u32>, UpdateThreadError>`. An unexpected shutdown of the update thread is now an error instead of `None`.
+- Rename `RGBMatrix::get_framerate` to `RGBMatrix::framerate`.
+- `RGBMatrix::new` no longer takes the `requested_inputs` argument. Use the new `input_bits` option of `RGBMatrixConfig` instead, also available as `--input-bits`.
+- `MatrixCreationError::MemoryAccessError` holds the `io::Error`. The variants `TooManyParallelChains` and `InvalidDitherBits` are gone, as `InvalidConfig` reports them.
+- Parsing a `HardwareMapping` returns an `InvalidVariantError` and parsing a `NamedPixelMapperType` returns the new `InvalidPixelMapperError`.
+- `PanelType`, `MultiplexMapperType`, `RowAddressSetterType`, `NamedPixelMapperType` and `PiChip` are `#[non_exhaustive]`, so `match` expressions on them need a wildcard arm.
+- `NamedPixelMapperType::Mirror` takes a `MirrorDirection` instead of a `bool`, and `NamedPixelMapperType::Rotate` takes a `Rotation` instead of a `usize`, so an invalid angle can no longer cause a panic.
+- Turn the CLI `interlaced` argument into a switch.
+- Replace the `drop_privs` option with the `no_drop_privs` switch.
+- `led_brightness` outside of 1 to 100 is now an error instead of being clamped.
 - New `MatrixCreationError` variants `ThreadPanicked` and `InvalidConfig`.
 - `NamedPixelMapperType` is no longer `Copy`, because `Remap` holds a list of panels.
 - `RGBMatrixConfig::slowdown` is an `i32`, to allow -1, and `RGBMatrixConfig` has new fields.

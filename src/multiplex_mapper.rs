@@ -5,6 +5,7 @@ use crate::{error::InvalidVariantError, rgb_matrix::MatrixCreationError};
     parse_err_fn = InvalidVariantError::new::<Self>,
     parse_err_ty = InvalidVariantError
 )]
+#[non_exhaustive]
 pub enum MultiplexMapperType {
     Stripe,
     Checkered,

@@ -1,6 +1,28 @@
-use std::{error::Error, str::FromStr};
+use std::str::FromStr;
 
-use crate::rgb_matrix::MatrixCreationError;
+use crate::{error::InvalidPixelMapperError, rgb_matrix::MatrixCreationError};
+
+/// The direction in which [`NamedPixelMapperType::Mirror`] flips the display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MirrorDirection {
+    /// Swap left and right.
+    Horizontal,
+    /// Swap top and bottom.
+    Vertical,
+}
+
+/// The clockwise angle by which [`NamedPixelMapperType::Rotate`] turns the display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Rotation {
+    /// Keep the display as it is.
+    Deg0,
+    /// A quarter turn clockwise.
+    Deg90,
+    /// A half turn.
+    Deg180,
+    /// A quarter turn counterclockwise.
+    Deg270,
+}
 
 /// Enum representing different pixel mapping options for mapping the logical layout of your boards
 /// to your physical arrangement. These options allow you to customize the mapping to match your unique setup.
@@ -11,15 +33,16 @@ use crate::rgb_matrix::MatrixCreationError;
 /// For example, to first mirror the panels horizontally and then rotate the resulting screen,
 /// You can use `--pixelmapper Mirror:H --pixelmapper Rotate:90`
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum NamedPixelMapperType {
     /// The "Mirror" mapper allows you to mirror the output either horizontally or vertically.
     /// Specify 'H' for horizontal mirroring or 'V' for vertical mirroring as a parameter after a colon.
     /// Example: `--pixelmapper Mirror:H`
-    Mirror(bool),
+    Mirror(MirrorDirection),
     /// The "Rotate" mapper allows you to rotate your screen clockwise by a multiple of 90 degrees.
     /// Specify the desired angle as a parameter after a colon. Negative angles rotate counterclockwise.
     /// Example: `--pixelmapper Rotate:90` for a 90-degree rotation.
-    Rotate(usize),
+    Rotate(Rotation),
     /// The `UMapper` represents a pixel mapping strategy where a long chain of display panels
     /// is arranged in a U-shape configuration. This arrangement allows for a single chain display
     /// with panels of double height but still utilizing only one data chain.
@@ -165,7 +188,7 @@ impl FromStr for RemapLayout {
 }
 
 impl FromStr for NamedPixelMapperType {
-    type Err = Box<dyn Error>;
+    type Err = InvalidPixelMapperError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let (command, param) = s.split_once(':').unwrap_or((s, ""));
@@ -176,10 +199,9 @@ impl FromStr for NamedPixelMapperType {
                 return match param {
                     "" => Ok(Self::VMapper(false)),
                     "Z" | "z" => Ok(Self::VMapper(true)),
-                    other => Err(format!(
+                    other => Err(InvalidPixelMapperError::new(format!(
                         "'{other}' is not valid. V-mapper parameter should be either empty or 'Z'"
-                    )
-                    .into()),
+                    ))),
                 };
             }
             "StackToRow" => {
@@ -189,10 +211,9 @@ impl FromStr for NamedPixelMapperType {
                         'Z' | 'z' => serpentine = true,
                         'F' | 'f' => flip_right = true,
                         other => {
-                            return Err(format!(
+                            return Err(InvalidPixelMapperError::new(format!(
                                 "'{other}' is not valid. StackToRow parameters are 'Z' and 'F'"
-                            )
-                            .into());
+                            )));
                         }
                     }
                 }
@@ -201,35 +222,46 @@ impl FromStr for NamedPixelMapperType {
                     flip_right,
                 });
             }
-            "Remap" => return Ok(Self::Remap(param.parse()?)),
+            "Remap" => {
+                return Ok(Self::Remap(
+                    param.parse().map_err(InvalidPixelMapperError::new)?,
+                ));
+            }
             _ => {}
         }
         if let Some((command, param)) = s.split_once(':') {
             match command {
                 "Mirror" => match param {
-                    "H" | "h" => Ok(Self::Mirror(true)),
-                    "V" | "v" => Ok(Self::Mirror(false)),
-                    other => Err(format!(
+                    "H" | "h" => Ok(Self::Mirror(MirrorDirection::Horizontal)),
+                    "V" | "v" => Ok(Self::Mirror(MirrorDirection::Vertical)),
+                    other => Err(InvalidPixelMapperError::new(format!(
                         "'{other}' is not valid. Mirror parameter should be either 'V' or 'H'"
-                    )
-                    .into()),
+                    ))),
                 },
                 "Rotate" => {
-                    if let Ok(angle) = param.parse::<isize>() {
-                        if angle % 90 != 0 {
-                            return Err(format!(
-                                "'{angle}' is not valid. Rotation needs to be a multiple of 90 degrees"
-                            )
-                            .into());
-                        }
-                        return Ok(Self::Rotate(angle.rem_euclid(360).unsigned_abs()));
+                    let Ok(angle) = param.parse::<i64>() else {
+                        return Err(InvalidPixelMapperError::new(
+                            "Rotation angle is missing or invalid",
+                        ));
+                    };
+                    match angle.rem_euclid(360) {
+                        0 => Ok(Self::Rotate(Rotation::Deg0)),
+                        90 => Ok(Self::Rotate(Rotation::Deg90)),
+                        180 => Ok(Self::Rotate(Rotation::Deg180)),
+                        270 => Ok(Self::Rotate(Rotation::Deg270)),
+                        _ => Err(InvalidPixelMapperError::new(format!(
+                            "'{angle}' is not valid. Rotation needs to be a multiple of 90 degrees"
+                        ))),
                     }
-                    Err("Rotation angle is missing or invalid".into())
                 }
-                other => Err(format!("'{other}' is not a valid Pixel mapping.").into()),
+                other => Err(InvalidPixelMapperError::new(format!(
+                    "'{other}' is not a valid Pixel mapping."
+                ))),
             }
         } else {
-            Err(format!("'{s}' is not a valid Pixel mapping.").into())
+            Err(InvalidPixelMapperError::new(format!(
+                "'{s}' is not a valid Pixel mapping."
+            )))
         }
     }
 }
@@ -241,17 +273,10 @@ impl NamedPixelMapperType {
         parallel: usize,
     ) -> Result<Box<dyn NamedPixelMapper>, MatrixCreationError> {
         match *self {
-            NamedPixelMapperType::Mirror(horizontal) => {
-                Ok(Box::new(MirrorPixelMapper { horizontal }))
+            NamedPixelMapperType::Mirror(direction) => {
+                Ok(Box::new(MirrorPixelMapper { direction }))
             }
-            NamedPixelMapperType::Rotate(angle) => {
-                if angle % 90 != 0 {
-                    return Err(MatrixCreationError::PixelMapperError(format!(
-                        "Rotation needs to be a multiple of 90 degrees, got {angle}."
-                    )));
-                }
-                Ok(Box::new(RotatePixelMapper { angle: angle % 360 }))
-            }
+            NamedPixelMapperType::Rotate(rotation) => Ok(Box::new(RotatePixelMapper { rotation })),
             NamedPixelMapperType::UMapper => Ok(Box::new(UArrangeMapper::new_with_parameters(
                 chain, parallel,
             )?)),
@@ -330,7 +355,7 @@ pub(crate) trait NamedPixelMapper {
 }
 
 struct MirrorPixelMapper {
-    horizontal: bool,
+    direction: MirrorDirection,
 }
 
 impl NamedPixelMapper for MirrorPixelMapper {
@@ -349,16 +374,15 @@ impl NamedPixelMapper for MirrorPixelMapper {
         x: usize,
         y: usize,
     ) -> [usize; 2] {
-        if self.horizontal {
-            [matrix_width - 1 - x, y]
-        } else {
-            [x, matrix_height - 1 - y]
+        match self.direction {
+            MirrorDirection::Horizontal => [matrix_width - 1 - x, y],
+            MirrorDirection::Vertical => [x, matrix_height - 1 - y],
         }
     }
 }
 
 struct RotatePixelMapper {
-    angle: usize,
+    rotation: Rotation,
 }
 
 impl NamedPixelMapper for RotatePixelMapper {
@@ -367,10 +391,9 @@ impl NamedPixelMapper for RotatePixelMapper {
         matrix_width: usize,
         matrix_height: usize,
     ) -> Result<[usize; 2], MatrixCreationError> {
-        if self.angle.is_multiple_of(180) {
-            Ok([matrix_width, matrix_height])
-        } else {
-            Ok([matrix_height, matrix_width])
+        match self.rotation {
+            Rotation::Deg0 | Rotation::Deg180 => Ok([matrix_width, matrix_height]),
+            Rotation::Deg90 | Rotation::Deg270 => Ok([matrix_height, matrix_width]),
         }
     }
 
@@ -381,12 +404,11 @@ impl NamedPixelMapper for RotatePixelMapper {
         x: usize,
         y: usize,
     ) -> [usize; 2] {
-        match self.angle {
-            0 => [x, y],
-            90 => [matrix_width - y - 1, x],
-            180 => [matrix_width - x - 1, matrix_height - y - 1],
-            270 => [y, matrix_height - x - 1],
-            _ => unreachable!(),
+        match self.rotation {
+            Rotation::Deg0 => [x, y],
+            Rotation::Deg90 => [matrix_width - y - 1, x],
+            Rotation::Deg180 => [matrix_width - x - 1, matrix_height - y - 1],
+            Rotation::Deg270 => [y, matrix_height - x - 1],
         }
     }
 }
@@ -670,16 +692,21 @@ impl NamedPixelMapper for RemapMapper {
 
 #[cfg(test)]
 mod tests {
-    use super::NamedPixelMapperType;
+    use super::{MirrorDirection, NamedPixelMapperType, Rotation};
     use std::str::FromStr;
 
     #[test]
     fn parses_rotation() {
         let parse = |s| NamedPixelMapperType::from_str(s).ok();
-        assert_eq!(parse("Rotate:90"), Some(NamedPixelMapperType::Rotate(90)));
-        assert_eq!(parse("Rotate:-90"), Some(NamedPixelMapperType::Rotate(270)));
-        assert_eq!(parse("Rotate:450"), Some(NamedPixelMapperType::Rotate(90)));
+        let rotate = |rotation| Some(NamedPixelMapperType::Rotate(rotation));
+        assert_eq!(parse("Rotate:90"), rotate(Rotation::Deg90));
+        assert_eq!(parse("Rotate:-90"), rotate(Rotation::Deg270));
+        assert_eq!(parse("Rotate:450"), rotate(Rotation::Deg90));
         assert_eq!(parse("Rotate:45"), None);
+        assert_eq!(
+            parse("Mirror:v"),
+            Some(NamedPixelMapperType::Mirror(MirrorDirection::Vertical))
+        );
     }
 
     #[test]
@@ -796,11 +823,5 @@ mod tests {
         assert_eq!(mapper.get_size_mapping(80, 20).unwrap(), [40, 40]);
         assert_eq!(mapper.map_visible_to_matrix(80, 20, 0, 0), [40, 0]);
         assert_eq!(mapper.map_visible_to_matrix(80, 20, 0, 20), [39, 19]);
-    }
-
-    #[test]
-    fn rejects_invalid_rotation() {
-        assert!(NamedPixelMapperType::Rotate(45).create(1, 1).is_err());
-        assert!(NamedPixelMapperType::Rotate(450).create(1, 1).is_ok());
     }
 }

@@ -49,7 +49,7 @@ impl Rp1Rio {
         let layout = Rp1Layout::new(config, true)?;
         let slowdown = config.slowdown.unwrap_or(1).max(1) as usize;
         let word_ns = 1e9 / (BASE_PIXEL_CLOCK_HZ / slowdown as f64);
-        let map = map_registers().ok_or(MatrixCreationError::MemoryAccessError)?;
+        let map = map_registers().map_err(MatrixCreationError::MemoryAccessError)?;
         let mut registers = RioRegisters {
             map,
             slowdown,
@@ -97,24 +97,32 @@ impl Drop for Rp1Rio {
     }
 }
 
-fn map_registers() -> Option<MmapMut> {
+/// Maps the RP1 registers, with the error of the last attempt if none of them works.
+fn map_registers() -> std::io::Result<MmapMut> {
     // gpiomem0 gives access to the RP1 GPIO registers without root privileges.
-    [
+    let attempts = [
         ("/dev/gpiomem0", 0),
         ("/dev/gpiomem0", PI5_PERIPHERAL_BASE),
         ("/dev/mem", PI5_PERIPHERAL_BASE),
-    ]
-    .into_iter()
-    .find_map(|(path, offset)| {
-        let file = OpenOptions::new().read(true).write(true).open(path).ok()?;
-        unsafe {
-            MmapOptions::new()
-                .offset(offset)
-                .len(MAP_SIZE_BYTES)
-                .map_mut(&file)
-                .ok()
+    ];
+    let mut last_error = None;
+    for (path, offset) in attempts {
+        let result = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .and_then(|file| unsafe {
+                MmapOptions::new()
+                    .offset(offset)
+                    .len(MAP_SIZE_BYTES)
+                    .map_mut(&file)
+            });
+        match result {
+            Ok(map) => return Ok(map),
+            Err(error) => last_error = Some(error),
         }
-    })
+    }
+    Err(last_error.expect("there is at least one attempt"))
 }
 
 /// Where a frame is written to: the RP1 registers, or a recording in the tests.
